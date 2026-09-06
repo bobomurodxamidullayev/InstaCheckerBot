@@ -9,7 +9,7 @@ import re
 import secrets
 from dataclasses import dataclass
 from typing import Any, Optional
-from urllib.parse import quote, unquote, urlparse, urlunparse
+from urllib.parse import quote, quote_plus, unquote, urlparse, urlunparse
 
 from curl_cffi import CurlError
 from curl_cffi.requests import AsyncSession
@@ -32,7 +32,7 @@ from models.username_log import CheckStatus
 
 logger = logging.getLogger(__name__)
 
-_OEMBED_URL = "https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/{username}/"
+_OEMBED_ENDPOINT = "https://www.instagram.com/api/v1/oembed/?url="
 _PROFILE_URL = "https://www.instagram.com/{username}/"
 
 _REQUEST_TIMEOUT = 6.0
@@ -260,7 +260,8 @@ class InstagramChecker:
         session: AsyncSession,
         username: str,
     ) -> dict[str, Any]:
-        oembed_url = _OEMBED_URL.format(username=quote(username, safe="._"))
+        profile_url = f"https://www.instagram.com/{username}/"
+        oembed_url = f"{_OEMBED_ENDPOINT}{quote_plus(profile_url)}"
         try:
             resp = await self._request(session, "GET", oembed_url, _OEMBED_HEADERS)
         except _NETWORK_EXCEPTIONS as exc:
@@ -298,11 +299,25 @@ class InstagramChecker:
                 last_error = exc
                 continue
 
-            raw_text = _body_text(response)
             response_url = str(getattr(response, "url", ""))
+            if "checkpoint" in response_url or "challenge" in response_url:
+                try:
+                    async with AsyncSession(**self._session_kwargs(None)) as direct_session:
+                        response = await self._request(
+                            direct_session,
+                            "GET",
+                            profile_url,
+                            _PROFILE_HEADERS,
+                        )
+                except _NETWORK_EXCEPTIONS as exc:
+                    last_error = exc
+                    continue
+                response_url = str(getattr(response, "url", ""))
+
+            raw_text = _body_text(response)
             username_lower = username.lower()
 
-            if "/accounts/login" in response_url or "checkpoint" in response_url:
+            if "/accounts/login/" in response_url:
                 return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
             if (
                 "Followers" in raw_text
