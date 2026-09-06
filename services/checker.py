@@ -89,8 +89,8 @@ _NETWORK_EXCEPTIONS = (
 _USERNAME_RE = re.compile(r"^[a-z0-9._]{1,30}$")
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 _OG_TYPE_RE = re.compile(
-    r'<meta[^>]+(?:property|name)=["\']og:type["\'][^>]+content=["\']([^"\']+)["\']'
-    r"|<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']og:type["\']",
+    r'''<meta[^>]+(?:property|name)=["']og:type["'][^>]+content=["']([^"']+)["']'''
+    r'''|<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:type["']''',
     re.IGNORECASE,
 )
 
