@@ -600,12 +600,15 @@ class InstagramChecker:
         proxy: str | None,
     ) -> dict[str, Any]:
         """
-        Faqat app check tarmoq/SSL xatosi bo'lganda chaqiriladi.
-        Profil GET HTML marker asosida TAKEN/AVAILABLE qaytaradi.
+        App check 429 yoki tarmoq xatosi bo'lganda profil GET zaxirasi.
 
-        kind=ok (TAKEN)     -> HTML marker topildi
-        kind=ok (AVAILABLE) -> 404 / marker yo'q
-        kind=skip           -> tarmoq/429 xato — yuqori qatlamga retry
+        kind=ok (TAKEN)
+          source=profile_marker       -> HTML da faol profil teglari topildi
+          source=profile_deactive_200 -> HTTP 200 lekin marker yo'q
+                                         (deactive / banned akkauntlar shunday beradi)
+        kind=ok (AVAILABLE)
+          source=profile_404          -> HTTP 404 yoki "Page Not Found"
+        kind=skip -> tarmoq/429 xato, ham bo'lmadi -> yuqori qatlamga
         """
         profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
         sticky_proxy = _make_session_proxy(self._base_proxy) if self._base_proxy else proxy
@@ -614,7 +617,7 @@ class InstagramChecker:
             try:
                 resp = await self._request(session, "GET", profile_url, _PROFILE_HEADERS)
             except _NETWORK_EXCEPTIONS as exc:
-                logger.warning("[@%s] profil GET zaxira xato: %s", username, exc)
+                logger.warning("[@%s] profil GET zaxira tarmoq/SSL: %s", username, exc)
                 return {"kind": "skip", "error": f"{type(exc).__name__}: {exc}"}
 
             if _is_wrong_origin(resp):
@@ -628,16 +631,42 @@ class InstagramChecker:
             html = _body_text(resp)
             final_url = str(getattr(resp, "url", "") or "")
 
+            # ── Faol profil markerlari bor -> TAKEN ───────────────────────────
             if _html_proves_existing_profile(html, username, final_url):
-                logger.debug("[@%s] profil zaxira: HTML marker -> TAKEN", username)
+                logger.info("[@%s] profil zaxira: marker topildi -> TAKEN", username)
                 return {"kind": "ok", "status": CheckStatus.TAKEN,
-                        "source": "profile_fallback"}
+                        "source": "profile_marker"}
 
-            # 404 yoki marker yo'q -> AVAILABLE
-            logger.debug("[@%s] profil zaxira: marker yo'q (HTTP %d) -> AVAILABLE",
-                         username, sc)
-            return {"kind": "ok", "status": CheckStatus.AVAILABLE,
-                    "source": "profile_fallback"}
+            # ── HTTP 404 yoki "Page Not Found" -> AVAILABLE ───────────────────
+            lower = html.lower()
+            is_page_not_found = (
+                sc == 404
+                or "sorry, this page isn't available" in lower
+                or "page not found" in lower
+                or "the link you followed may be broken" in lower
+            )
+            if is_page_not_found:
+                logger.info("[@%s] profil zaxira: 404/Page Not Found -> AVAILABLE", username)
+                return {"kind": "ok", "status": CheckStatus.AVAILABLE,
+                        "source": "profile_404"}
+
+            # ── HTTP 200 lekin marker yo'q -> TAKEN (deactive/banned) ─────────
+            # Instagram mavjud bo'lmagan nomlar 404 beradi.
+            # 200 + marker yo'q = akkaunt o'chiq (deactive/ban/lock).
+            if sc == 200:
+                logger.info(
+                    "[@%s] profil zaxira: HTTP 200, marker yo'q -> TAKEN (deactive/ban)",
+                    username,
+                )
+                return {"kind": "ok", "status": CheckStatus.TAKEN,
+                        "source": "profile_deactive_200"}
+
+            # ── Noma'lum status -> TAKEN (ehtiyot tomoni) ─────────────────────
+            logger.info(
+                "[@%s] profil zaxira: HTTP %d noma'lum -> TAKEN (xavfsiz)", username, sc,
+            )
+            return {"kind": "ok", "status": CheckStatus.TAKEN,
+                    "source": "profile_deactive_200"}
 
     # ── Asosiy funnel ─────────────────────────────────────────────────────────
 
@@ -648,9 +677,13 @@ class InstagramChecker:
         skip_topsearch: bool = False,
     ) -> dict[str, Any]:
         """
-        1) topsearch exact match  -> TAKEN
-        2) Android App API check  -> AVAILABLE / TAKEN
-        3) Zaxira (app xato)      -> profil GET HTML marker -> TAKEN / AVAILABLE
+        1) topsearch exact match   -> TAKEN
+        2) Android App API check   -> AVAILABLE / TAKEN
+        3) App 429 yoki tarmoq xato bo'lsa darhol profil GET zaxirasi:
+             marker       -> TAKEN  (source: profile_marker)
+             404/not found-> AVAILABLE  (source: profile_404)
+             200/no marker-> TAKEN  (source: profile_deactive_200)
+             zaxira ham skip -> TAKEN (hech qachon ERROR emas)
         """
         search_url = _TOPSEARCH_URL.format(query=quote(username, safe="._"))
 
@@ -671,14 +704,15 @@ class InstagramChecker:
         if app_result["kind"] == "ok":
             return app_result
 
-        # App check 429 -> rate_limited, yuqori qavatga o'tkazamiz
-        if app_result.get("rate_limited"):
-            return app_result
-
-        # App check tarmoq xatosi (rate_limited=False) -> profil GET zaxira
+        # App check xato (429 yoki tarmoq) -> DARHOL profil GET zaxirasi
+        # Loop ga qaytmaslik uchun bu yerda hal qilinadi
+        err_msg = app_result.get("error", "app check xato")
+        is_rate = app_result.get("rate_limited", False)
         logger.info(
-            "[@%s] app check xato (%s), profil GET zaxirasi",
-            username, app_result.get("error"),
+            "[@%s] app check %s (%s) -> profil GET zaxirasi",
+            username,
+            "HTTP 429" if is_rate else "xato",
+            err_msg,
         )
 
         # ── 3-bosqich: profil GET zaxira ──────────────────────────────────────
@@ -686,9 +720,17 @@ class InstagramChecker:
         if fallback["kind"] == "ok":
             return fallback
 
-        # Zaxira ham o'tmadi — retry qaytaramiz
-        return {"kind": "retry", "rate_limited": fallback.get("rate_limited", False),
-                "error": fallback.get("error", "Barcha bosqichlar muvaffaqiyatsiz")}
+        # Profil zaxira ham skip/xato bo'ldi -> TAKEN (eng xavfsiz tomon)
+        # Foydalanuvchi hech qachon ERROR ko'rmasin
+        logger.warning(
+            "[@%s] profil zaxira ham xato (%s) -> TAKEN (xavfsiz yopish)",
+            username, fallback.get("error"),
+        )
+        return {
+            "kind": "ok",
+            "status": CheckStatus.TAKEN,
+            "source": "ultimate_fallback",
+        }
 
 
 instagram_checker = InstagramChecker()
