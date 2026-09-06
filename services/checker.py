@@ -11,6 +11,7 @@ import logging
 import random
 import re
 import secrets
+import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import quote, unquote, urlparse, urlunparse
@@ -37,7 +38,8 @@ from models.username_log import CheckStatus
 logger = logging.getLogger(__name__)
 
 _OEMBED_URL = "https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/{username}/"
-_NATIVE_CHECK_URL = "https://i.instagram.com/api/v1/users/check_username/"
+_SIGNUP_PAGE_URL = "https://www.instagram.com/accounts/emailsignup/"
+_SIGNUP_ATTEMPT_URL = "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
 
 _REQUEST_TIMEOUT = 20.0
 _IMPERSONATE = "chrome124"
@@ -51,14 +53,20 @@ _OEMBED_HEADERS: dict[str, str] = {
     "Accept": "application/json",
 }
 
-_NATIVE_HEADERS: dict[str, str] = {
-    "User-Agent": (
-        "Instagram 269.0.0.18.75 Android (30/11; 480dpi; 1080x2176; "
-        "Xiaomi; Mi A3; laurel_sprout; qcom; ru_RU; 314665256)"
-    ),
-    "Accept-Language": "en-US",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+_SIGNUP_PAGE_HEADERS: dict[str, str] = {
+    "User-Agent": _CHROME_USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+_SIGNUP_HEADERS: dict[str, str] = {
+    "User-Agent": _CHROME_USER_AGENT,
+    "X-CSRFToken": "missing",
     "X-IG-App-ID": "936619743392459",
+    "X-ASBD-ID": "129477",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": _SIGNUP_PAGE_URL,
+    "Content-Type": "application/x-www-form-urlencoded",
 }
 
 _NETWORK_EXCEPTIONS = (
@@ -151,7 +159,7 @@ def _parse_json_body(response: Any) -> dict[str, Any] | None:
 
 
 class InstagramChecker:
-    """Instagram username mavjudligini oEmbed va native mobile API orqali tekshiradi."""
+    """Instagram username mavjudligini oEmbed va signup validation orqali tekshiradi."""
 
     def __init__(self, proxy_url: str | None = None) -> None:
         self._base_proxy: str | None = proxy_url or (
@@ -159,14 +167,14 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=oembed+native",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=oembed+signup",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
         )
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (oEmbed + native) | proxy=%s",
+            "InstagramChecker ishga tushdi (oEmbed + signup) | proxy=%s",
             bool(self._base_proxy),
         )
 
@@ -293,25 +301,51 @@ class InstagramChecker:
             return {"kind": "check_required", "error": "oEmbed profile not found"}
         return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_taken"}
 
-    async def _try_native(
+    async def _try_signup(
         self,
-        session: AsyncSession,
         username: str,
+        proxy: str | None,
     ) -> dict[str, Any]:
+        session_kwargs = self._session_kwargs(proxy)
+        session_kwargs["headers"] = _SIGNUP_PAGE_HEADERS
+        response: Any = None
         try:
-            response = await self._request(
-                session,
-                "POST",
-                _NATIVE_CHECK_URL,
-                _NATIVE_HEADERS,
-                data={"username": username},
-            )
+            async with AsyncSession(**session_kwargs) as session:
+                await self._request(
+                    session,
+                    "GET",
+                    _SIGNUP_PAGE_URL,
+                    _SIGNUP_PAGE_HEADERS,
+                )
+                csrf_token = session.cookies.get("csrftoken") or "missing"
+                headers = {**_SIGNUP_HEADERS, "X-CSRFToken": csrf_token}
+                response = await self._request(
+                    session,
+                    "POST",
+                    _SIGNUP_ATTEMPT_URL,
+                    headers,
+                    data={
+                        "email": f"chk_{uuid.uuid4().hex[:10]}@gmail.com",
+                        "username": username,
+                        "first_name": "",
+                        "opt_into_one_tap": "false",
+                    },
+                )
         except _NETWORK_EXCEPTIONS as exc:
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            raw_text = _body_text(response) if response is not None else ""
+            logger.warning(
+                "[@%s] signup validation exception | status=%d | body=%r | error=%s",
+                username,
+                status_code,
+                raw_text,
+                exc,
+            )
             return {
                 "kind": "ok",
                 "status": CheckStatus.TAKEN,
                 "source": "safe_fallback",
-                "error": f"native network error: {exc}",
+                "error": f"signup network error: {exc}",
             }
 
         status_code = int(getattr(response, "status_code", 0) or 0)
@@ -322,19 +356,18 @@ class InstagramChecker:
         if not payload:
             return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_fallback"}
 
-        if payload.get("available") is True:
-            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "native_available"}
-
-        if (
-            payload.get("available") is False
-            or "error" in payload
-            or payload.get("status") == "fail"
-        ):
+        errors = payload.get("errors")
+        if isinstance(errors, dict) and "username" in errors:
             return {
                 "kind": "ok",
                 "status": CheckStatus.TAKEN,
-                "source": "native_taken_banned",
+                "source": "signup_taken_banned",
             }
+
+        if payload.get("status") == "ok" and not (
+            isinstance(errors, dict) and "username" in errors
+        ):
+            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "signup_available"}
 
         return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_fallback"}
 
@@ -347,7 +380,7 @@ class InstagramChecker:
             if oembed["kind"] != "check_required":
                 return oembed
 
-            return await self._try_native(session, username)
+            return await self._try_signup(username, proxy)
 
 
 instagram_checker = InstagramChecker()
