@@ -282,10 +282,11 @@ class InstagramChecker:
             payload = _parse_json_body(resp)
             if payload and ("author_name" in payload or "author_id" in payload):
                 return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "oembed_active"}
-            return {"kind": "error", "error": "oEmbed response missing account identity"}
-        if status_code in (400, 404):
-            return {"kind": "check_required", "error": "oEmbed profile not found"}
-        return {"kind": "error", "error": f"oEmbed unexpected status: {status_code}"}
+            return {"kind": "check_required", "error": "oEmbed response missing account identity"}
+        return {
+            "kind": "check_required",
+            "error": f"oEmbed status {status_code}; proceeding to profile check",
+        }
 
     async def _try_profile_check(
         self,
