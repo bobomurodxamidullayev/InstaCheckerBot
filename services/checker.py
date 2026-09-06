@@ -751,12 +751,11 @@ class InstagramChecker:
         """
         Profil GET sahifasini HTML marker asosida tahlil qiladi.
 
-        kind=ok (TAKEN)     -> HTML da aniq profil markerlari topildi
-                               (og:description Followers/Posts, "username" JSON, va h.k.)
-        kind=ok (AVAILABLE) -> Profil markerlari yo'q YOKI sahifa 404 / "Page Not Found"
-                               Instagram bo'sh nomlar uchun ham 200 qaytaradi (SPA shell),
-                               shuning uchun faqat markerga ishoniladi.
-        kind=skip           -> Tarmoq xato, 429 — retry
+        kind=ok (TAKEN)  -> HTML da aniq profil markerlari topildi.
+        kind=continue    -> Marker topilmadi. html_status + html + final_url
+                           saqlab uzatiladi — signup attempt hakamga yuboriladi.
+                           (deactive/ban/spam-lock nomlar marker bermaydi!)
+        kind=skip        -> Tarmoq xato, 429 — retry.
         """
         try:
             html_resp = await self._request(session, "GET", profile_url, _PROFILE_HEADERS)
@@ -776,7 +775,7 @@ class InstagramChecker:
         html = _body_text(html_resp)
         final_url = str(getattr(html_resp, "url", "") or "")
 
-        # ── Aniq TAKEN: HTML da profil markerlari mavjud ──────────────────────
+        # Aniq TAKEN: HTML da profil markerlari mavjud
         if _html_proves_existing_profile(html, username, final_url):
             logger.debug("[@%s] profil GET: HTML marker topildi -> TAKEN", username)
             return {
@@ -785,19 +784,19 @@ class InstagramChecker:
                 "source": "profile HTML marker",
             }
 
-        # ── AVAILABLE: marker yo'q yoki "Page Not Found" ──────────────────────
-        # Instagram mavjud bo'lmagan nomlar uchun SPA shell (200) yoki
-        # "Sorry, this page isn't available" (200/404) qaytaradi.
-        # Marker yo'q = profil yo'q = AVAILABLE.
+        # Marker yo'q -> signup attempt hakamga yuboriladi
+        # (deactive/ban/spam-lock nomlar HTML marker bermaydi, lekin signup
+        #  attempt errors.username orqali ularni aniqlaydi)
         logger.debug(
-            "[@%s] profil GET HTTP %d: marker yo'q -> AVAILABLE",
+            "[@%s] profil GET HTTP %d: marker yo'q -> signup attempt hakam",
             username,
             html_status,
         )
         return {
-            "kind": "ok",
-            "status": CheckStatus.AVAILABLE,
-            "source": "profile_not_found",
+            "kind": "continue",
+            "html": html,
+            "html_status": html_status,
+            "final_url": final_url,
         }
 
     async def _finish_with_signup(
@@ -807,32 +806,90 @@ class InstagramChecker:
         profile_result: dict[str, Any],
     ) -> dict[str, Any]:
         """
-        Profil GET natijasiga qarab:
-        - ok   -> TAKEN yoki AVAILABLE to'g'ridan qaytaradi
-        - skip -> Profil GET network/429 xatosi bo'lganda zaxira sifatida
-                  signup attempt ishlatiladi. U ham 429 bersa -> profil 404
-                  deb qabul qilib AVAILABLE qaytaradi (ERROR emas).
+        Profil GET natijasiga qarab to'liq zanjir:
+
+        ok       -> TAKEN to'g'ridan qaytadi (marker topilgan)
+        continue -> signup attempt hakam:
+                     errors.username bor  -> TAKEN (deactive/ban/spam-lock)
+                     errors.username yo'q -> AVAILABLE (nom toza)
+                     429 bo'lsa fallback  -> html_status==200 -> TAKEN
+                                            html_status==404  -> AVAILABLE
+        skip     -> profil GET tarmoq/429 xatosi:
+                     signup attempt fresh -> ok -> TAKEN/AVAILABLE
+                     429/retry            -> AVAILABLE (nom yo'q ehtimoli)
         """
         if profile_result["kind"] == "ok":
             return profile_result
 
-        # kind=skip — profil GET timeout/429/SSL: sticky IP bilan signup attempt
-        logger.info("[@%s] profil GET o'tkazildi, signup attempt zaxirasi", username)
+        # ── Profil HTML ma'lumotlari (429 fallback uchun) ─────────────────────
+        prof_html: str = profile_result.get("html", "")
+        prof_status: int = profile_result.get("html_status", 0)
+        prof_final_url: str = profile_result.get("final_url", "")
+
+        if profile_result["kind"] == "continue":
+            # Signup attempt — asosiy hakam
+            classified = await self._signup_attempt_in_session(
+                session, username, prior_response=None
+            )
+
+            # 429 -> sticky IP bilan bir marta qayta urinish
+            if classified.get("rate_limited"):
+                logger.warning(
+                    "[@%s] signup attempt 429 | sticky IP bilan qayta urinish",
+                    username,
+                )
+                classified = await self._signup_attempt_fresh(username, self._get_session_proxy())
+
+            # Signup attempt baribir 429/retry -> html_status bo'yicha yakuniy qaror
+            if classified["kind"] == "retry":
+                return self._resolve_by_http_status(username, prof_status, prof_final_url)
+
+            return classified
+
+        # kind=skip — profil GET tarmoq/429 xatosi: sticky IP bilan signup attempt
+        logger.info("[@%s] profil GET skip, signup attempt zaxirasi", username)
         classified = await self._signup_attempt_fresh(username, self._get_session_proxy())
 
-        # Signup attempt 429/retry -> AVAILABLE (profil GET o'tkazildi = nom yo'q ehtimoli)
         if classified["kind"] == "retry":
-            logger.info(
-                "[@%s] signup attempt ham xato (profil GET skip edi) -> AVAILABLE",
-                username,
-            )
-            return {
-                "kind": "ok",
-                "status": CheckStatus.AVAILABLE,
-                "source": "skip_fallback",
-            }
+            # Profil HTML ma'lumoti yo'q (skip edi) -> AVAILABLE (nom yo'q ehtimoli)
+            logger.info("[@%s] signup attempt ham xato (skip edi) -> AVAILABLE", username)
+            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "skip_fallback"}
 
         return classified
+
+    def _resolve_by_http_status(
+        self,
+        username: str,
+        html_status: int,
+        final_url: str,
+    ) -> dict[str, Any]:
+        """
+        Signup attempt 429 bo'lganda OXIRGI hakam — profil HTTP statusiga tayanadi.
+
+        Qoida:
+          200 (login redirect emas) -> TAKEN  (mavjud/yopiq nom)
+          404 / "Page Not Found"    -> AVAILABLE (nom hech qachon ro'yxatdan o'tmagan)
+          Boshqa/noma'lum           -> TAKEN  (xavfsiz tomon)
+
+        Hech qachon ERROR qaytarmaydi.
+        """
+        url_lower = (final_url or "").lower()
+        is_login = "/accounts/login" in url_lower or "/challenge" in url_lower
+
+        if html_status == 200 and not is_login:
+            logger.info("[@%s] 429-fallback: profil 200 -> TAKEN", username)
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "http_status_fallback"}
+
+        if html_status == 404 or _html_is_page_not_found("", html_status, final_url):
+            logger.info("[@%s] 429-fallback: profil 404 -> AVAILABLE", username)
+            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "http_status_fallback"}
+
+        # Login redirect yoki noma'lum -> TAKEN (ehtiyot tomoni)
+        logger.info(
+            "[@%s] 429-fallback: profil status=%d (login/noma'lum) -> TAKEN",
+            username, html_status,
+        )
+        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "http_status_fallback"}
 
 
     async def _signup_attempt_fresh(
@@ -959,12 +1016,13 @@ class InstagramChecker:
         Funnel (bosqichma-bosqich):
 
         1) topsearch — aniq username match -> TAKEN
-        2) Profil GET — HTML marker asosida:
-             marker topildi          -> TAKEN  (source: profile HTML marker)
-             marker yo'q / 404       -> AVAILABLE (source: profile_not_found)
-             tarmoq/429 xato (skip)  -> signup attempt zaxirasi
-
-        signup attempt faqat profil GET tarmoq/429 xatosi bo'lganda ishlatiladi.
+        2) Profil GET:
+             HTML marker topildi (ok/TAKEN)    -> TAKEN
+             Marker yo'q (continue)            -> signup attempt hakam
+                errors.username -> TAKEN (deactive/ban/spam-lock)
+                username ok     -> AVAILABLE
+                429 fallback    -> http_status: 200=TAKEN, 404=AVAILABLE
+             Tarmoq/429 xato (skip)            -> signup attempt zaxira
         """
         search_url = _TOPSEARCH_URL.format(query=quote(username, safe="._"))
         profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
@@ -976,12 +1034,9 @@ class InstagramChecker:
                 search_result = await self._try_topsearch(session, username, search_url)
                 if search_result["kind"] == "ok":
                     return search_result
-                # kind=continue: topsearch da match yo'q -> profil GET
+                # kind=continue: topsearch da match yo'q -> profil GET + signup zanjir
                 if search_result["kind"] == "continue":
                     profile_result = await self._try_profile_get(session, username, profile_url)
-                    if profile_result["kind"] == "ok":
-                        return profile_result
-                    # kind=skip: profil GET xato -> signup attempt zaxirasi
                     return await self._finish_with_signup(username, session, profile_result)
 
             current_proxy = self._get_session_proxy()
@@ -992,9 +1047,6 @@ class InstagramChecker:
         kwargs = self._session_kwargs(current_proxy)
         async with AsyncSession(**kwargs) as session:
             profile_result = await self._try_profile_get(session, username, profile_url)
-            if profile_result["kind"] == "ok":
-                return profile_result
-            # kind=skip: profil GET xato -> signup attempt zaxirasi
             return await self._finish_with_signup(username, session, profile_result)
 
 
