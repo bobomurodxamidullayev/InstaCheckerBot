@@ -1,12 +1,15 @@
 """
 services/checker.py — Instagram username tekshirish servisi.
 
-Strategiya: profil sahifasi GET + HTML tahlil (faqat status_code EMAS).
-  404 yoki not-found HTML  -> available
-  haqiqiy profil belgilari -> taken
-  429                      -> yangi DataImpulse sessiya + exponential backoff
+Asosiy yo'l: GET /api/v1/users/web_profile_info/?username=...
+  404 / "user not found"     -> available
+  200 + data.user            -> taken  (banned/deactivated ham)
+  400 / 403 (claim/restrict) -> taken
+  429                        -> yangi DataImpulse sessiya + backoff
 
-Klient: curl_cffi AsyncSession (impersonate=chrome124, verify=False, allow_redirects=True).
+Zaxira: HTML profil GET (login-wall / noaniq javob).
+
+Klient: curl_cffi AsyncSession (impersonate=chrome124, verify=False).
 
 VPS:
     pip install "curl_cffi>=0.7.1"
@@ -15,6 +18,7 @@ VPS:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import re
@@ -47,6 +51,10 @@ logger = logging.getLogger(__name__)
 # ─── Konstantlar ──────────────────────────────────────────────────────────────
 
 _PROFILE_URL = "https://www.instagram.com/{username}/"
+_WEB_PROFILE_INFO_URL = (
+    "https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+)
+_IG_APP_ID = "936619743392459"
 _MAX_RETRIES = 3
 _REQUEST_TIMEOUT = 12.0
 _IMPERSONATE = "chrome124"
@@ -57,18 +65,22 @@ _CHROME_UA = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-_PROFILE_HEADERS: dict[str, str] = {
+_COMMON_HEADERS: dict[str, str] = {
     "User-Agent": _CHROME_UA,
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,image/apng,*/*;q=0.8"
-    ),
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
     "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Platform": '"Windows"',
+}
+
+_PROFILE_HEADERS: dict[str, str] = {
+    **_COMMON_HEADERS,
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
@@ -193,6 +205,19 @@ def _response_snippet(response: Any, limit: int = 800) -> str:
     return str(content)[:limit]
 
 
+def _html_text(response: Any) -> str:
+    text = getattr(response, "text", None)
+    if isinstance(text, str):
+        return text
+    content = getattr(response, "content", b"")
+    if isinstance(content, (bytes, bytearray)):
+        try:
+            return bytes(content).decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+    return str(content or "")
+
+
 def _is_wrong_origin(response: Any) -> bool:
     """
     verify=False tufayli proxy Google (yoki boshqa host) sertifikatini
@@ -220,22 +245,72 @@ def _is_wrong_origin(response: Any) -> bool:
     return False
 
 
-def _html_text(response: Any) -> str:
-    text = getattr(response, "text", None)
-    if isinstance(text, str):
-        return text
-    content = getattr(response, "content", b"")
-    if isinstance(content, (bytes, bytearray)):
-        try:
-            return bytes(content).decode("utf-8", errors="ignore")
-        except Exception:
-            return ""
-    return str(content or "")
+def _is_login_wall(response: Any, body: str) -> bool:
+    final_url = str(getattr(response, "url", "") or "").lower()
+    if "/accounts/login" in final_url:
+        return True
+    lowered = body.lower()
+    markers = (
+        "login_required",
+        "checkpoint_required",
+        "please wait a few minutes",
+        "suspicious activity",
+    )
+    return any(marker in lowered for marker in markers) and "web_profile_info" not in final_url
 
 
-def _is_login_redirect(final_url: str, html: str) -> bool:
-    del html  # faqat yakuniy URL — navbardagi login linki available sahifani buzmasin
-    return "/accounts/login" in (final_url or "").lower()
+def _parse_json_body(response: Any) -> dict[str, Any] | None:
+    try:
+        data = response.json()
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+
+    text = _html_text(response).strip()
+    if not text or text[0] not in "{[":
+        return None
+    try:
+        data = json.loads(text)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _json_message(payload: dict[str, Any]) -> str:
+    return str(payload.get("message") or payload.get("error") or "").strip()
+
+
+def _is_user_not_found(payload: dict[str, Any]) -> bool:
+    msg = _json_message(payload).lower()
+    if "user not found" in msg:
+        return True
+    if payload.get("status") == "fail" and "not found" in msg:
+        return True
+    return False
+
+
+def _extract_user(payload: dict[str, Any]) -> Any:
+    data = payload.get("data")
+    if isinstance(data, dict) and "user" in data:
+        return data.get("user")
+    if "user" in payload:
+        return payload.get("user")
+    return None
+
+
+def _api_headers(username: str) -> dict[str, str]:
+    return {
+        **_COMMON_HEADERS,
+        "Accept": "*/*",
+        "X-IG-App-ID": _IG_APP_ID,
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": _PROFILE_URL.format(username=username),
+        "Origin": "https://www.instagram.com",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
 
 
 def _has_real_profile_html(html: str, username: str) -> bool:
@@ -267,46 +342,109 @@ def _has_real_profile_html(html: str, username: str) -> bool:
     return False
 
 
-def _classify_profile_response(
+def _classify_api_response(
+    status_code: int,
+    payload: dict[str, Any] | None,
+    response: Any,
+    body: str,
+) -> dict[str, Any]:
+    """
+    web_profile_info javobi.
+    kind: ok | retry | fallback
+    """
+    if status_code == 429:
+        return {
+            "kind": "retry",
+            "rate_limited": True,
+            "error": "HTTP 429 Rate Limited (web_profile_info)",
+        }
+
+    if status_code >= 500:
+        return {
+            "kind": "retry",
+            "rate_limited": False,
+            "error": f"HTTP {status_code} (web_profile_info server)",
+        }
+
+    if _is_login_wall(response, body) and not payload:
+        return {
+            "kind": "fallback",
+            "error": "Login-wall (web_profile_info)",
+        }
+
+    if status_code == 404:
+        return {"kind": "ok", "status": CheckStatus.AVAILABLE}
+
+    if payload and _is_user_not_found(payload):
+        return {"kind": "ok", "status": CheckStatus.AVAILABLE}
+
+    if payload:
+        user = _extract_user(payload)
+        if isinstance(user, dict) and (user.get("id") or user.get("pk") or user.get("username")):
+            return {"kind": "ok", "status": CheckStatus.TAKEN}
+        if user is None and status_code == 200:
+            return {"kind": "ok", "status": CheckStatus.AVAILABLE}
+
+    if status_code in (400, 403):
+        if payload and _is_user_not_found(payload):
+            return {"kind": "ok", "status": CheckStatus.AVAILABLE}
+        if _is_login_wall(response, body):
+            return {
+                "kind": "fallback",
+                "error": f"HTTP {status_code} login/checkpoint",
+            }
+        # Username claim qilingan, banned yoki cheklangan
+        return {"kind": "ok", "status": CheckStatus.TAKEN}
+
+    if status_code == 200 and payload is None:
+        return {
+            "kind": "fallback",
+            "error": "web_profile_info JSON emas",
+        }
+
+    return {
+        "kind": "fallback",
+        "error": f"web_profile_info noaniq HTTP {status_code}",
+    }
+
+
+def _classify_profile_html(
     status_code: int,
     html: str,
     username: str,
     final_url: str,
-) -> tuple[str, Any]:
-    """
-    Profil metategi bor -> taken.
-    Metateg yo'q (bo'sh Instagram shell) -> available.
-    Retry faqat 429 / login wall / server xatosi.
-    """
+) -> dict[str, Any]:
     if status_code == 429:
-        return "retry", {
+        return {
+            "kind": "retry",
             "rate_limited": True,
             "error": "HTTP 429 Rate Limited (profile GET)",
         }
 
-    if status_code >= 500 or status_code in (401, 403):
-        return "retry", {
+    if status_code >= 500:
+        return {
+            "kind": "retry",
             "rate_limited": False,
-            "error": f"HTTP {status_code} (server/block)",
+            "error": f"HTTP {status_code} (HTML server)",
         }
 
     if _has_real_profile_html(html, username):
-        return "ok", CheckStatus.TAKEN
+        return {"kind": "ok", "status": CheckStatus.TAKEN}
 
-    if _is_login_redirect(final_url, html):
-        return "retry", {
+    if "/accounts/login" in (final_url or "").lower():
+        return {
+            "kind": "retry",
             "rate_limited": False,
-            "error": "Login redirect — profil metategi yo'q",
+            "error": "HTML login redirect",
         }
 
-    # 404, 200 bo'sh shell, client-side not-found — profil signali yo'q = available
-    return "ok", CheckStatus.AVAILABLE
+    return {"kind": "ok", "status": CheckStatus.AVAILABLE}
 
 
 # ─── Asosiy tekshiruvchi sinf ──────────────────────────────────────────────────
 
 class InstagramChecker:
-    """Instagram username mavjudligini profil GET orqali tekshiruvchi sinf."""
+    """Instagram username mavjudligini web_profile_info orqali tekshiruvchi sinf."""
 
     def __init__(self, proxy_url: str | None = None) -> None:
         self._base_proxy: str | None = proxy_url or (
@@ -314,7 +452,7 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | client=curl_cffi/%s | verify=off",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | client=curl_cffi/%s | api=web_profile_info",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
             _IMPERSONATE,
@@ -322,7 +460,7 @@ class InstagramChecker:
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (profile GET, curl_cffi) | proxy=%s",
+            "InstagramChecker ishga tushdi (web_profile_info, curl_cffi) | proxy=%s",
             bool(self._base_proxy),
         )
 
@@ -339,7 +477,7 @@ class InstagramChecker:
             "max_clients": 1,
             "verify": False,
             "allow_redirects": True,
-            "headers": _PROFILE_HEADERS,
+            "headers": _COMMON_HEADERS,
         }
         if proxy:
             kwargs["proxy"] = proxy
@@ -434,7 +572,8 @@ class InstagramChecker:
 
             if result["kind"] == "ok":
                 status: CheckStatus = result["status"]
-                logger.info("[@%s] %s (HTML profile)", username, status.value)
+                source = result.get("source", "api")
+                logger.info("[@%s] %s (%s)", username, status.value, source)
                 return CheckResult(
                     username=username,
                     status=status,
@@ -481,50 +620,74 @@ class InstagramChecker:
         proxy: str | None,
     ) -> dict[str, Any]:
         """
-        Bitta yangi proxy sessiya + bitta profil GET.
-        Istisnolar chaqiruvchiga chiqadi.
+        Bitta yangi proxy sessiya: avval web_profile_info, kerak bo'lsa HTML fallback.
         """
-        url = _PROFILE_URL.format(username=quote(username, safe="._"))
         kwargs = self._session_kwargs(proxy)
+        api_url = _WEB_PROFILE_INFO_URL.format(username=quote(username, safe="._"))
+        profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
 
         async with AsyncSession(**kwargs) as session:
-            response = await session.get(
-                url,
+            api_resp = await session.get(
+                api_url,
+                headers=_api_headers(username),
+                timeout=_REQUEST_TIMEOUT,
+                allow_redirects=True,
+                verify=False,
+            )
+
+            if _is_wrong_origin(api_resp):
+                return {
+                    "kind": "retry",
+                    "rate_limited": False,
+                    "error": "Proxy noto'g'ri origin (Google/boshqa host) qaytardi",
+                }
+
+            status_code = int(getattr(api_resp, "status_code", 0) or 0)
+            body = _html_text(api_resp)
+            payload = _parse_json_body(api_resp)
+            logger.debug(
+                "[@%s] API GET -> HTTP %d json=%s body=%dB",
+                username,
+                status_code,
+                bool(payload),
+                len(body),
+            )
+
+            classified = _classify_api_response(status_code, payload, api_resp, body)
+            if classified["kind"] == "ok":
+                classified["source"] = "web_profile_info"
+                return classified
+            if classified["kind"] == "retry":
+                return classified
+
+            logger.info(
+                "[@%s] API fallback HTML | %s",
+                username,
+                classified.get("error"),
+            )
+
+            html_resp = await session.get(
+                profile_url,
                 headers=_PROFILE_HEADERS,
                 timeout=_REQUEST_TIMEOUT,
                 allow_redirects=True,
                 verify=False,
             )
 
-        status_code = int(getattr(response, "status_code", 0) or 0)
-        final_url = str(getattr(response, "url", "") or "")
-        html = _html_text(response)
-        logger.debug(
-            "[@%s] GET %s -> HTTP %d final=%s html=%dB",
-            username,
-            url,
-            status_code,
-            final_url[:120] or "-",
-            len(html),
-        )
-
-        if _is_wrong_origin(response):
+        if _is_wrong_origin(html_resp):
             return {
                 "kind": "retry",
                 "rate_limited": False,
-                "error": "Proxy noto'g'ri origin (Google/boshqa host) qaytardi",
+                "error": "Proxy noto'g'ri origin (HTML fallback)",
             }
 
-        kind, payload = _classify_profile_response(
-            status_code, html, username, final_url
-        )
-        if kind == "ok":
-            return {"kind": "ok", "status": payload}
-        return {
-            "kind": "retry",
-            "rate_limited": bool(payload.get("rate_limited")),
-            "error": payload.get("error"),
-        }
+        html_status = int(getattr(html_resp, "status_code", 0) or 0)
+        html = _html_text(html_resp)
+        final_url = str(getattr(html_resp, "url", "") or "")
+        html_result = _classify_profile_html(html_status, html, username, final_url)
+        if html_result["kind"] == "ok":
+            html_result["source"] = "html_fallback"
+        return html_result
 
 
 instagram_checker = InstagramChecker()
