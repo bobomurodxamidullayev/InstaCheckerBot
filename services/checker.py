@@ -2,9 +2,8 @@
 services/checker.py — Instagram username tekshirish servisi.
 
 Yagona yo'l: GET https://www.instagram.com/{username}/
-  AVAILABLE — faqat HTTP 404 yoki 410
-  TAKEN     — faol profil, login/challenge redirect, yoki
-              200 + "Sorry, this page isn't available" (bloklangan/o'chirilgan)
+  TAKEN     — og:type=profile / owner_user_id / og:description stats / ld+json ProfilePage
+  AVAILABLE — HTTP 404/410, yoki HTTP 200 va TAKEN belgilari yo'q (bo'sh React shell)
   ERROR     — HTTP 429 (max 3 urinish, backoff + yangi proxy sessiya)
               yoki tarmoq/SSL uzilishi
 
@@ -86,25 +85,24 @@ _NETWORK_EXCEPTIONS = (
 )
 
 _USERNAME_RE = re.compile(r"^[a-z0-9._]{1,30}$")
-_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
-_OG_TITLE_RE = re.compile(
-    r'''<meta[^>]+(?:property|name)=["']og:title["'][^>]+content=["']([^"']+)["']'''
-    r'''|<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:title["']''',
-    re.IGNORECASE,
-)
 _OG_TYPE_RE = re.compile(
     r'''<meta[^>]+(?:property|name)=["']og:type["'][^>]+content=["']([^"']+)["']'''
     r'''|<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:type["']''',
     re.IGNORECASE,
 )
-
-_UNAVAILABLE_PAGE_MARKERS: tuple[str, ...] = (
-    "sorry, this page isn't available",
-    "sorry, this page isn&#39;t available",
-    "sorry, this page isn&apos;t available",
-    "this page isn't available",
-    "the link you followed may be broken",
-    "page not found",
+_OG_DESC_RE = re.compile(
+    r'''<meta[^>]+(?:property|name)=["']og:description["'][^>]+content=["']([^"']+)["']'''
+    r'''|<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:description["']''',
+    re.IGNORECASE,
+)
+_LD_JSON_RE = re.compile(
+    r'''<script[^>]+type=["']application/ld\+json["'][^>]*>(.*?)</script>''',
+    re.IGNORECASE | re.DOTALL,
+)
+_OG_DESC_STATS_RE = re.compile(r"\b(followers|following|posts)\b", re.IGNORECASE)
+_PROFILE_LD_TYPE_RE = re.compile(
+    r'''"@type"\s*:\s*"(?:ProfilePage|Person)"''',
+    re.IGNORECASE,
 )
 
 _LOGIN_CHALLENGE_MARKERS: tuple[str, ...] = (
@@ -263,45 +261,35 @@ def _is_login_or_challenge(url: str) -> bool:
     return any(marker in lowered for marker in _LOGIN_CHALLENGE_MARKERS)
 
 
-def _has_unavailable_page(html: str) -> bool:
-    if not html:
-        return False
-    lowered = html.lower()
-    return any(marker in lowered for marker in _UNAVAILABLE_PAGE_MARKERS)
-
-
-def _has_real_profile_html(html: str, username: str) -> bool:
-    """Faol profil: og:title / og:type=profile / owner_user_id / (@username)."""
+def _has_taken_profile_signals(html: str) -> bool:
+    """Faol profil: aniq SSR/meta belgilari (bo'sh React shell bunda yo'q)."""
     if not html:
         return False
 
     lowered = html.lower()
-    uname = username.lower()
 
     if "instapp:owner_user_id" in lowered:
         return True
 
-    og_type = None
     og_type_match = _OG_TYPE_RE.search(html)
     if og_type_match:
         og_type = (og_type_match.group(1) or og_type_match.group(2) or "").strip().lower()
-    if og_type == "profile":
-        return True
+        if og_type == "profile":
+            return True
     if re.search(r'"og:type"\s*:\s*"profile"', lowered):
         return True
 
-    og_title = ""
-    og_title_match = _OG_TITLE_RE.search(html)
-    if og_title_match:
-        og_title = (og_title_match.group(1) or og_title_match.group(2) or "").strip()
-    if og_title and re.search(rf"@{re.escape(uname)}\b", og_title, re.IGNORECASE):
-        return True
-
-    title_match = _TITLE_RE.search(html)
-    if title_match:
-        title = re.sub(r"\s+", " ", title_match.group(1))
-        if re.search(rf"\(@{re.escape(uname)}\)", title, re.IGNORECASE):
+    og_desc_match = _OG_DESC_RE.search(html)
+    if og_desc_match:
+        og_desc = (og_desc_match.group(1) or og_desc_match.group(2) or "")
+        if _OG_DESC_STATS_RE.search(og_desc):
             return True
+
+    for ld_match in _LD_JSON_RE.finditer(html):
+        if _PROFILE_LD_TYPE_RE.search(ld_match.group(1) or ""):
+            return True
+    if _PROFILE_LD_TYPE_RE.search(html):
+        return True
 
     return False
 
@@ -314,11 +302,11 @@ def _classify_profile_get(
     location: str,
 ) -> dict[str, Any]:
     """
-    Profile GET qat'iy tasnif.
+    Profile GET tasnif.
 
-    AVAILABLE faqat 404/410.
-    TAKEN: profil meta, login/challenge redirect, yoki 200 + unavailable matni.
-    Retry faqat 429 (yoki noto'g'ri origin — Instagram javobi emas).
+    TAKEN: aniq profil belgilari yoki login/challenge redirect.
+    AVAILABLE: 404/410, yoki 200 va profil belgilari yo'q (bo'sh React shell).
+    Retry: faqat 429.
     """
     if status_code == 429:
         return {
@@ -336,28 +324,23 @@ def _classify_profile_get(
             return {"kind": "ok", "status": CheckStatus.TAKEN}
         dest_l = dest.lower()
         if "instagram.com" in dest_l:
-            # Trailing-slash / www kabi profil redirecti — nom band.
             return {"kind": "ok", "status": CheckStatus.TAKEN}
         return {
-            "kind": "error",
+            "kind": "retry",
+            "rate_limited": False,
             "error": f"HTTP {status_code} noma'lum Location: {dest[:180]}",
         }
 
     if status_code == 200:
-        if _has_real_profile_html(html, username):
+        if _has_taken_profile_signals(html):
             return {"kind": "ok", "status": CheckStatus.TAKEN}
         if _is_login_or_challenge(final_url) or _is_login_or_challenge(location):
             return {"kind": "ok", "status": CheckStatus.TAKEN}
-        if _has_unavailable_page(html):
-            # Bloklangan, o'chirilgan yoki shadowban — status 404 EMAS.
-            return {"kind": "ok", "status": CheckStatus.TAKEN}
-        return {
-            "kind": "error",
-            "error": "HTTP 200, profil meta va unavailable sahifa yo'q",
-        }
+        return {"kind": "ok", "status": CheckStatus.AVAILABLE}
 
     return {
-        "kind": "error",
+        "kind": "retry",
+        "rate_limited": False,
         "error": f"HTTP {status_code} (profile GET)",
     }
 
