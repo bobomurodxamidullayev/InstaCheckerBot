@@ -749,8 +749,10 @@ class InstagramChecker:
         profile_url: str,
     ) -> dict[str, Any]:
         """
-        kind=ok       -> TAKEN (HTML da qat'iy profil markerlari bo'lsa)
-        kind=continue -> login/404/bo'sh/marker yo'q — signup_attempt ga o't
+        kind=ok       -> TAKEN
+                         - HTTP 200: akkaunt mavjud, deactive, ban yoki lock — barchasi 200 beradi.
+                         - HTML marker bo'lmasa ham 200 = TAKEN.
+        kind=continue -> profil GET 404 yoki login redirect — signup_attempt ga o't
         kind=skip     -> timeout/429/SSL — signup_attempt ga o't
         """
         try:
@@ -770,16 +772,27 @@ class InstagramChecker:
 
         html = _body_text(html_resp)
         final_url = str(getattr(html_resp, "url", "") or "")
-        if html_status == 200 and _html_proves_existing_profile(html, username, final_url):
-            return {
-                "kind": "ok",
-                "status": CheckStatus.TAKEN,
-                "source": "profile GET",
-                "response": html_resp,
-            }
+
+        # HTTP 200 = akkaunt mavjud (faol, deactive, banned, locked — barchasi 200 beradi).
+        # Login redirect bo'lsa final_url da /accounts/login bor — uni o'tkazib yuboramiz.
+        if html_status == 200:
+            url_lower = final_url.lower()
+            if "/accounts/login" not in url_lower and "/challenge" not in url_lower:
+                logger.debug(
+                    "[@%s] profil GET HTTP 200 -> TAKEN (deactive/ban/lock ham 200 beradi)",
+                    username,
+                )
+                return {
+                    "kind": "ok",
+                    "status": CheckStatus.TAKEN,
+                    "source": "profile GET 200",
+                    "response": html_resp,
+                }
+            # Login redirect -> foydalanuvchi login qilinmagan, aniq xulosa yo'q
+            logger.debug("[@%s] profil GET 200 lekin login redirect — signup attempt", username)
 
         logger.debug(
-            "[@%s] profil GET HTTP %d, qat'iy marker yo'q | signup attempt tasdiqlash",
+            "[@%s] profil GET HTTP %d, signup attempt tasdiqlash",
             username,
             html_status,
         )
@@ -852,32 +865,43 @@ class InstagramChecker:
         final_url: str,
     ) -> dict[str, Any]:
         """
-        Signup attempt 429/retry bo'lganda yakuniy hakam sifatida profil
-        HTML ga tayanib AVAILABLE yoki TAKEN qaytaradi.
+        Signup attempt 429/retry bo'lganda yakuniy hakam — profil GET statusiga tayanadi.
 
-        Qoida:
-          - Profil HTML da faol profil teglari (Followers/Posts/og:description)
-            100% isbotlansa -> TAKEN
-          - Aks holda (404, bo'sh, login redirect, marker yo'q) -> AVAILABLE
-            (source=signup_429_fallback)
+        Qat'iy qoida (HTML marker SHART EMAS):
+          HTTP 200 -> HAR DOIM TAKEN
+                      (faol, deactive, banned, 14-kun lock — barchasi 200 beradi)
+          HTTP 404 -> AVAILABLE
+                      (nom hech qachon ro'yxatdan o'tmagan)
+          Boshqa / noma'lum -> TAKEN (ehtiyot tomoni: xato yo'l qo'ymaslik)
 
         Hech qachon ERROR qaytarmaydi.
         """
-        # Profil HTML da qat'iy isbotlangan profil bor -> TAKEN
-        if html and _html_proves_existing_profile(html, username, final_url):
+        url_lower = (final_url or "").lower()
+        is_login_redirect = "/accounts/login" in url_lower or "/challenge" in url_lower
+
+        if html_status == 200 and not is_login_redirect:
+            # 200 = akkaunt mavjud (faol, deactive, ban, lock)
             logger.info(
-                "[@%s] signup 429-fallback: profil HTML isbotladi -> TAKEN",
+                "[@%s] signup 429-fallback: profil GET 200 -> TAKEN",
                 username,
             )
             return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "signup_429_fallback"}
 
-        # 404 / login / marker yo'q -> AVAILABLE
+        if html_status == 404 or _html_is_page_not_found(html, html_status, final_url):
+            # 404 = nom hech qachon ro'yxatdan o'tmagan -> AVAILABLE
+            logger.info(
+                "[@%s] signup 429-fallback: profil GET 404 -> AVAILABLE",
+                username,
+            )
+            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "signup_429_fallback"}
+
+        # Login redirect yoki noma'lum holat -> TAKEN (xavfsiz tomon)
         logger.info(
-            "[@%s] signup 429-fallback: profil isbotlanmadi (status=%d) -> AVAILABLE",
+            "[@%s] signup 429-fallback: profil status=%d (login/noma'lum) -> TAKEN (xavfsiz)",
             username,
             html_status,
         )
-        return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "signup_429_fallback"}
+        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "signup_429_fallback"}
 
 
     async def _signup_attempt_fresh(
