@@ -1,13 +1,8 @@
-"""
-services/checker.py — Instagram username tekshirish servisi.
+"""Instagram username tekshirish servisi.
 
-2-bosqichli funnel (login cookie / CSRF shart emas):
-  1) Topsearch exact match -> TAKEN
-  2) GET /{username}/embed/captioned/ -> AVAILABLE / TAKEN
-
-web_profile_info va web_create_ajax/attempt ishlatilmaydi.
-Tarmoq/proxy xatosida bitta yangi sticky IP bilan qayta uriniladi;
-aks holda xavfsiz TAKEN. Foydalanuvchiga ERROR qaytmaydi.
+The native Android endpoint is the only primary source. Any ambiguous result
+is deliberately treated as TAKEN so transient Instagram responses cannot
+produce a false AVAILABLE result.
 """
 from __future__ import annotations
 
@@ -45,25 +40,22 @@ logger = logging.getLogger(__name__)
 _TOPSEARCH_URL = (
     "https://www.instagram.com/web/search/topsearch/?context=blended&query={query}"
 )
-_EMBED_URL = "https://www.instagram.com/{username}/embed/captioned/"
+_ANDROID_CHECK_USERNAME_URL = "https://i.instagram.com/api/v1/users/check_username/"
 
 _REQUEST_TIMEOUT = 20.0
-_IMPERSONATE = "chrome124"
-_CHROME_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+_IMPERSONATE = "chrome120"
+_ANDROID_UA = (
+    "Instagram 269.0.0.18.75 Android (30/11; 480dpi; 1080x2176; Xiaomi; "
+    "Mi A3; laurel_sprout; qcom; ru_RU; 314665256)"
 )
 
 _JSON_HEADERS: dict[str, str] = {
-    "User-Agent": _CHROME_UA,
+    "User-Agent": _ANDROID_UA,
     "Accept": "application/json",
-    "Referer": "https://www.instagram.com/",
-}
-
-_EMBED_HEADERS: dict[str, str] = {
-    "User-Agent": _CHROME_UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Language": "en-US",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "X-IG-App-ID": "936619743392459",
+    "X-FB-HTTP-Engine": "Liger",
 }
 
 _NETWORK_EXCEPTIONS = (
@@ -77,20 +69,6 @@ _NETWORK_EXCEPTIONS = (
 )
 
 _USERNAME_RE = re.compile(r"^[a-z0-9._]{1,30}$")
-
-_PAGE_NOT_FOUND_MARKERS = (
-    "page not found",
-    "sorry, this page isn't available",
-    "the link you followed may be broken",
-)
-
-_EMBED_EXISTS_MARKERS = (
-    "watch on instagram",
-    "view more on instagram",
-    "caption",
-    "avatar",
-)
-
 
 @dataclass
 class CheckResult:
@@ -214,57 +192,38 @@ def _exact_username_in_search(payload: dict[str, Any], username: str) -> bool:
     return False
 
 
-def _html_has_page_not_found(html: str) -> bool:
-    lower = html.lower()
-    return any(marker in lower for marker in _PAGE_NOT_FOUND_MARKERS)
+def _is_timeout_exception(exc: BaseException) -> bool:
+    return isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or (
+        "timeout" in type(exc).__name__.lower()
+    )
 
 
-def _html_has_embed_exists_marker(html: str, username: str) -> bool:
-    lower = html.lower()
-    if f"instagram.com/{username.lower()}" in lower:
-        return True
-    return any(marker in lower for marker in _EMBED_EXISTS_MARKERS)
-
-
-def _classify_embed(status_code: int, html: str, username: str) -> dict[str, Any]:
-    """
-    Tartib:
-      1) 404 yoki Page Not Found -> AVAILABLE
-      2) 200 + faol embed markerlari -> TAKEN
-      3) 200 / redirect, Page Not Found yo'q -> TAKEN (deactive/ban)
-    """
+def _classify_android_response(
+    status_code: int,
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Classify only explicit native JSON signals; everything else is fallback."""
     if status_code == 429:
-        return {"kind": "retry", "error": "HTTP 429 Rate Limited (embed)"}
+        return {"kind": "fallback", "error": "HTTP 429 Rate Limited"}
 
-    if status_code == 404 or _html_has_page_not_found(html):
-        return {
-            "kind": "ok",
-            "status": CheckStatus.AVAILABLE,
-            "source": "embed_404",
-        }
+    if not payload:
+        return {"kind": "safe_taken", "error": f"native HTTP {status_code} without JSON"}
 
-    if status_code == 200 and _html_has_embed_exists_marker(html, username):
-        return {
-            "kind": "ok",
-            "status": CheckStatus.TAKEN,
-            "source": "embed_exists",
-        }
+    if payload.get("available") is True:
+        return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "android_available"}
 
-    if status_code == 200 or status_code in (301, 302, 303, 307, 308):
-        return {
-            "kind": "ok",
-            "status": CheckStatus.TAKEN,
-            "source": "embed_deactive",
-        }
+    if payload.get("available") is False:
+        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "android_taken"}
 
-    return {
-        "kind": "retry",
-        "error": f"embed noma'lum HTTP {status_code}",
-    }
+    error = str(payload.get("error") or payload.get("error_type") or "").lower()
+    if error == "username_is_taken" or payload.get("status") == "fail":
+        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "android_taken"}
+
+    return {"kind": "safe_taken", "error": "native response is ambiguous"}
 
 
 class InstagramChecker:
-    """Instagram username mavjudligini topsearch + embed orqali tekshiradi."""
+    """Instagram username mavjudligini native Android endpoint orqali tekshiradi."""
 
     def __init__(self, proxy_url: str | None = None) -> None:
         self._base_proxy: str | None = proxy_url or (
@@ -272,14 +231,14 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=topsearch+embed",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=android",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
         )
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (topsearch + embed) | proxy=%s",
+            "InstagramChecker ishga tushdi (native Android) | proxy=%s",
             bool(self._base_proxy),
         )
 
@@ -293,7 +252,7 @@ class InstagramChecker:
             "max_clients": 1,
             "verify": False,
             "allow_redirects": True,
-            "headers": _EMBED_HEADERS,
+            "headers": _JSON_HEADERS,
         }
         if proxy:
             kwargs["proxy"] = proxy
@@ -309,8 +268,8 @@ class InstagramChecker:
         if not _USERNAME_RE.fullmatch(username_clean):
             return CheckResult(
                 username=username_clean,
-                status=CheckStatus.ERROR,
-                error_message="Noto'g'ri username formati",
+                status=CheckStatus.TAKEN,
+                error_message=None,
                 attempts=0,
             )
 
@@ -367,14 +326,40 @@ class InstagramChecker:
         method: str,
         url: str,
         headers: dict[str, str],
+        data: dict[str, str] | None = None,
     ) -> Any:
-        return await session.get(
+        request = session.post if method.upper() == "POST" else session.get
+        return await request(
             url,
             headers=headers,
+            data=data,
             timeout=_REQUEST_TIMEOUT,
             allow_redirects=True,
             verify=False,
             impersonate=_IMPERSONATE,
+        )
+
+    async def _try_android(
+        self,
+        session: AsyncSession,
+        username: str,
+    ) -> dict[str, Any]:
+        try:
+            resp = await self._request(
+                session,
+                "POST",
+                _ANDROID_CHECK_USERNAME_URL,
+                _JSON_HEADERS,
+                data={"username": username},
+            )
+        except _NETWORK_EXCEPTIONS as exc:
+            if _is_timeout_exception(exc):
+                return {"kind": "fallback", "error": f"native timeout: {exc}"}
+            return {"kind": "safe_taken", "error": f"native network error: {exc}"}
+
+        return _classify_android_response(
+            int(getattr(resp, "status_code", 0) or 0),
+            _parse_json_body(resp),
         )
 
     async def _try_topsearch(
@@ -386,62 +371,23 @@ class InstagramChecker:
         try:
             resp = await self._request(session, "GET", search_url, _JSON_HEADERS)
         except _NETWORK_EXCEPTIONS as exc:
-            logger.warning("[@%s] topsearch xato -> embed: %s", username, exc)
-            return {"kind": "continue"}
-
-        if _is_wrong_origin(resp):
-            logger.warning("[@%s] topsearch noto'g'ri origin -> embed", username)
-            return {"kind": "continue"}
+            return {"kind": "safe_taken", "error": f"topsearch network error: {exc}"}
 
         status_code = int(getattr(resp, "status_code", 0) or 0)
-        if status_code == 429:
-            logger.warning("[@%s] topsearch HTTP 429 -> embed", username)
-            return {"kind": "continue"}
-
         payload = _parse_json_body(resp)
-        if payload is None:
-            return {"kind": "continue"}
-
-        if _exact_username_in_search(payload, username):
+        if payload and _exact_username_in_search(payload, username):
             return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "topsearch"}
-
-        return {"kind": "continue"}
-
-    async def _try_embed(
-        self,
-        session: AsyncSession,
-        username: str,
-    ) -> dict[str, Any]:
-        embed_url = _EMBED_URL.format(username=quote(username, safe="._"))
-        try:
-            resp = await self._request(session, "GET", embed_url, _EMBED_HEADERS)
-        except _NETWORK_EXCEPTIONS as exc:
-            logger.warning("[@%s] embed tarmoq/SSL: %s", username, exc)
-            return {"kind": "retry", "error": f"{type(exc).__name__}: {exc}"}
-
-        if _is_wrong_origin(resp):
-            return {"kind": "retry", "error": "Proxy noto'g'ri origin (embed)"}
-
-        status_code = int(getattr(resp, "status_code", 0) or 0)
-        html = _body_text(resp)
-        classified = _classify_embed(status_code, html, username)
-        if classified.get("kind") == "ok":
-            logger.info(
-                "[@%s] embed HTTP %d -> %s (%s)",
-                username,
-                status_code,
-                classified["status"].value,
-                classified["source"],
-            )
-        return classified
+        return {"kind": "safe_taken", "error": f"topsearch ambiguous HTTP {status_code}"}
 
     async def _funnel_check(self, username: str, proxy: str | None) -> dict[str, Any]:
         kwargs = self._session_kwargs(proxy)
         async with AsyncSession(**kwargs) as session:
-            topsearch = await self._try_topsearch(session, username)
-            if topsearch["kind"] == "ok":
-                return topsearch
-            return await self._try_embed(session, username)
+            native = await self._try_android(session, username)
+            if native["kind"] == "ok":
+                return native
+            if native["kind"] == "fallback":
+                return await self._try_topsearch(session, username)
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_fallback"}
 
 
 instagram_checker = InstagramChecker()
