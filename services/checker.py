@@ -216,6 +216,8 @@ class InstagramChecker:
                         status=status,
                         attempts=attempt,
                     )
+                if result.get("retries_exhausted"):
+                    break
                 logger.warning(
                     "[@%s] tarmoq/proxy xato (%s) | urinish %d",
                     username_clean,
@@ -281,7 +283,7 @@ class InstagramChecker:
             if payload and ("author_name" in payload or "author_id" in payload):
                 return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "oembed_active"}
             return {"kind": "error", "error": "oEmbed response missing account identity"}
-        if status_code == 404:
+        if status_code in (400, 404):
             return {"kind": "check_required", "error": "oEmbed profile not found"}
         return {"kind": "error", "error": f"oEmbed unexpected status: {status_code}"}
 
@@ -289,25 +291,47 @@ class InstagramChecker:
         self,
         session: AsyncSession,
         username: str,
+        proxy: str | None,
     ) -> dict[str, Any]:
         profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
         headers = {
             **_WEB_PROFILE_HEADERS,
             "Referer": f"https://www.instagram.com/{username}/",
         }
-        try:
-            response = await self._request(
-                session,
-                "GET",
-                profile_url,
-                headers,
-                allow_redirects=False,
-            )
-        except _NETWORK_EXCEPTIONS as exc:
-            return {
-                "kind": "error",
-                "error": f"profile page network error: {exc}",
-            }
+        response: Any = None
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                if attempt == 0:
+                    response = await self._request(
+                        session,
+                        "GET",
+                        profile_url,
+                        headers,
+                        allow_redirects=False,
+                    )
+                else:
+                    retry_proxy = proxy if attempt == 1 else None
+                    fresh_kwargs = self._session_kwargs(retry_proxy)
+                    async with AsyncSession(**fresh_kwargs) as fresh_session:
+                        response = await self._request(
+                            fresh_session,
+                            "GET",
+                            profile_url,
+                            headers,
+                            allow_redirects=False,
+                        )
+                break
+            except _NETWORK_EXCEPTIONS as exc:
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep(0.5)
+                    continue
+                return {
+                    "kind": "error",
+                    "retries_exhausted": True,
+                    "error": f"profile page network error after 3 attempts: {last_error}",
+                }
 
         status_code = int(getattr(response, "status_code", 0) or 0)
         raw_text = _body_text(response)
@@ -346,7 +370,7 @@ class InstagramChecker:
             if oembed["kind"] != "check_required":
                 return oembed
 
-            return await self._try_profile_page(session, username)
+            return await self._try_profile_page(session, username, proxy)
 
 
 instagram_checker = InstagramChecker()
