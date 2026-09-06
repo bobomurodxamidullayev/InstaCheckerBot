@@ -1,0 +1,26 @@
+# ============================================================
+#  InstaChekerBot — Python Dependencies (v5)
+#  pip install -r requirements.txt
+#
+#  MUHIM: asyncmy O'CHIRILDI — Windows SelectorEventLoop bilan
+#  aiomysql to'g'ri ishlaydi, asyncmy qotib qoladi.
+# ============================================================
+
+# ─── Telegram Bot Framework ─────────────────────────────────
+aiogram==3.13.1
+
+# ─── HTTP Client (Instagram so'rovlari uchun) ───────────────
+# curl_cffi: Chrome TLS fingerprint (SSL handshake / RST muammolariga)
+curl_cffi>=0.7.1
+httpx[socks]==0.27.2
+
+# ─── Database ───────────────────────────────────────────────
+SQLAlchemy[asyncio]==2.0.36
+aiomysql==0.2.0
+# asyncmy — O'CHIRILDI (Windows ProactorEventLoop muammosi)
+
+# ─── Configuration ──────────────────────────────────────────
+pydantic-settings==2.6.1
+
+# ─── Utilities ──────────────────────────────────────────────
+python-dotenv==1.0.1
