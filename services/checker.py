@@ -9,6 +9,8 @@ Gibrid (funnel):
        429 -> yangi rotating proxy IP, 1 marta qayta urinish
 
 Klient: curl_cffi AsyncSession (impersonate=chrome124, verify=False).
+Timeout 20s. DataImpulse: har urinishda yangi `_session-{id}` (yangi IP).
+topsearch timeout/429/SSL da ERROR emas — profil GET yoki check_username.
 """
 from __future__ import annotations
 
@@ -54,34 +56,27 @@ _CHECK_USERNAME_URL = (
     "https://www.instagram.com/api/v1/web/accounts/check_username/"
 )
 _MAX_RETRIES = 3
-_REQUEST_TIMEOUT = 12.0
+_REQUEST_TIMEOUT = 20.0
 _IMPERSONATE = "chrome124"
 _BACKOFF_BASE = 2.0
 _BACKOFF_CAP = 30.0
 _IG_APP_ID = "936619743392459"
 
-_SEARCH_HEADERS: dict[str, str] = {
-    "Accept": "*/*",
+# Faqat kerakli Accept — rasmlar/og'ir scriptlar yuklanmasin.
+_JSON_HEADERS: dict[str, str] = {
+    "Accept": "application/json",
     "Referer": "https://www.instagram.com/",
 }
 
-_PROFILE_HEADERS: dict[str, str] = {
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,image/apng,*/*;q=0.8"
-    ),
+_HTML_HEADERS: dict[str, str] = {
+    "Accept": "text/html,application/xhtml+xml",
     "Referer": "https://www.instagram.com/",
     "Upgrade-Insecure-Requests": "1",
 }
 
-_SIGNUP_PAGE_HEADERS: dict[str, str] = {
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,image/apng,*/*;q=0.8"
-    ),
-    "Referer": "https://www.instagram.com/",
-    "Upgrade-Insecure-Requests": "1",
-}
+_SEARCH_HEADERS = _JSON_HEADERS
+_PROFILE_HEADERS = _HTML_HEADERS
+_SIGNUP_PAGE_HEADERS = _HTML_HEADERS
 
 _NETWORK_EXCEPTIONS = (
     RequestsError,
@@ -127,7 +122,9 @@ def _make_session_proxy(base_proxy: str | None) -> str | None:
     DataImpulse rotating proxy: har urinishda yangi sessiya ID.
 
     Kirish:  http://{login}__cr.us:pass@gw.dataimpulse.com:823
-    Chiqish: http://{login}__cr.us_session.{hex}:pass@gw.dataimpulse.com:823
+    Chiqish: http://{login}__cr.us_session-{id}:pass@gw.dataimpulse.com:823
+
+    Yangi sessiya ID = majburiy yangi residential IP (429/sticky IP oldini oladi).
     """
     if not base_proxy:
         return None
@@ -139,10 +136,10 @@ def _make_session_proxy(base_proxy: str | None) -> str | None:
     username = unquote(parsed.username)
     password = unquote(parsed.password or "")
 
-    username = re.sub(r"_session\.[0-9a-fA-F]+$", "", username)
-    username = re.sub(r"_sid\.[0-9a-fA-F]+$", "", username)
+    username = re.sub(r"_session[-.][A-Za-z0-9_-]+$", "", username)
+    username = re.sub(r"_sid[-.][A-Za-z0-9_-]+$", "", username)
 
-    session_user = f"{username}_session.{secrets.token_hex(8)}"
+    session_user = f"{username}_session-{secrets.token_hex(8)}"
     auth = f"{quote(session_user, safe='')}:{quote(password, safe='')}"
     host = parsed.hostname
     if parsed.port:
@@ -292,7 +289,7 @@ def _extract_csrftoken(response: Any, session: Any) -> str:
 
 def _check_username_headers(csrf: str) -> dict[str, str]:
     return {
-        "Accept": "*/*",
+        "Accept": "application/json",
         "Content-Type": "application/x-www-form-urlencoded",
         "X-CSRFToken": csrf,
         "X-IG-App-ID": _IG_APP_ID,
@@ -369,6 +366,7 @@ class InstagramChecker:
         logger.info("InstagramChecker to'xtatildi.")
 
     def _get_session_proxy(self) -> str | None:
+        """Har chaqiruvda yangi DataImpulse sessiya ID = yangi IP."""
         return _make_session_proxy(self._base_proxy)
 
     def _session_kwargs(self, proxy: str | None) -> dict[str, Any]:
@@ -378,7 +376,7 @@ class InstagramChecker:
             "max_clients": 1,
             "verify": False,
             "allow_redirects": True,
-            "headers": _SEARCH_HEADERS,
+            "headers": _HTML_HEADERS,
         }
         if proxy:
             kwargs["proxy"] = proxy
@@ -436,8 +434,16 @@ class InstagramChecker:
         last_error = "Noma'lum xato"
 
         for attempt in range(1, max_retries + 1):
+            # Har urinishda majburiy yangi DataImpulse sessiya (yangi IP).
             session_proxy = self._get_session_proxy()
-            logger.debug("[@%s] Urinish %d/%d | yangi proxy sessiya", username, attempt, max_retries)
+            skip_topsearch = attempt > 1
+            logger.debug(
+                "[@%s] Urinish %d/%d | yangi proxy sessiya | skip_topsearch=%s",
+                username,
+                attempt,
+                max_retries,
+                skip_topsearch,
+            )
 
             if attempt == 1:
                 await asyncio.sleep(
@@ -447,7 +453,11 @@ class InstagramChecker:
                 await asyncio.sleep(random.uniform(0.35, 0.9))
 
             try:
-                result = await self._funnel_check(username, session_proxy)
+                result = await self._funnel_check(
+                    username,
+                    session_proxy,
+                    skip_topsearch=skip_topsearch,
+                )
             except _NETWORK_EXCEPTIONS as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 logger.warning(
@@ -486,7 +496,7 @@ class InstagramChecker:
             if result.get("rate_limited"):
                 delay = _backoff_delay(attempt)
                 logger.warning(
-                    "[@%s] HTTP 429 | backoff %.1fs | urinish %d/%d",
+                    "[@%s] HTTP 429 | yangi IP + backoff %.1fs | urinish %d/%d",
                     username,
                     delay,
                     attempt,
@@ -516,120 +526,186 @@ class InstagramChecker:
             attempts=max_retries,
         )
 
-    async def _funnel_check(
+    async def _request(
         self,
+        session: AsyncSession,
+        method: str,
+        url: str,
+        headers: dict[str, str],
+        data: dict[str, str] | None = None,
+    ) -> Any:
+        kwargs: dict[str, Any] = {
+            "headers": headers,
+            "timeout": _REQUEST_TIMEOUT,
+            "allow_redirects": True,
+            "verify": False,
+            "impersonate": _IMPERSONATE,
+        }
+        if method == "POST":
+            return await session.post(url, data=data or {}, **kwargs)
+        return await session.get(url, **kwargs)
+
+    async def _try_topsearch(
+        self,
+        session: AsyncSession,
         username: str,
-        proxy: str | None,
+        search_url: str,
     ) -> dict[str, Any]:
         """
-        1) topsearch / profil GET — band bo'lsa darhol TAKEN.
-        2) 404 / topilmagan — check_username POST (AVAILABLE faqat available=true).
+        kind=ok -> TAKEN
+        kind=continue -> JSON OK, aniq match yo'q
+        kind=skip -> timeout/429/SSL/noto'g'ri javob — keyingi bosqichga o't
         """
-        kwargs = self._session_kwargs(proxy)
-        search_url = _TOPSEARCH_URL.format(query=quote(username, safe="._"))
-        profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
+        try:
+            search_resp = await self._request(session, "GET", search_url, _SEARCH_HEADERS)
+        except _NETWORK_EXCEPTIONS as exc:
+            logger.warning("[@%s] topsearch tarmoq/timeout/SSL: %s — profil GET", username, exc)
+            return {"kind": "skip", "error": f"{type(exc).__name__}: {exc}"}
 
-        async with AsyncSession(**kwargs) as session:
-            search_resp = await session.get(
-                search_url,
-                headers=_SEARCH_HEADERS,
-                timeout=_REQUEST_TIMEOUT,
-                allow_redirects=True,
-                verify=False,
-                impersonate=_IMPERSONATE,
-            )
+        if _is_wrong_origin(search_resp):
+            logger.warning("[@%s] topsearch noto'g'ri origin — profil GET", username)
+            return {"kind": "skip", "error": "Proxy noto'g'ri origin (topsearch)"}
 
-            if _is_wrong_origin(search_resp):
-                return {
-                    "kind": "retry",
-                    "rate_limited": False,
-                    "error": "Proxy noto'g'ri origin (topsearch)",
-                }
+        search_status = int(getattr(search_resp, "status_code", 0) or 0)
+        if search_status == 429:
+            logger.warning("[@%s] topsearch HTTP 429 — yangi IP + profil GET", username)
+            return {"kind": "skip", "rate_limited": True, "error": "HTTP 429 Rate Limited (topsearch)"}
 
-            search_status = int(getattr(search_resp, "status_code", 0) or 0)
-            if search_status == 429:
-                return {
-                    "kind": "retry",
-                    "rate_limited": True,
-                    "error": "HTTP 429 Rate Limited (topsearch)",
-                }
-
-            payload = _parse_json_body(search_resp)
-            if payload is None:
-                return {
-                    "kind": "retry",
-                    "rate_limited": False,
-                    "error": f"topsearch JSON emas (HTTP {search_status})",
-                }
-
-            if _exact_username_in_search(payload, username):
-                return {
-                    "kind": "ok",
-                    "status": CheckStatus.TAKEN,
-                    "source": "topsearch",
-                }
-
-            logger.debug(
-                "[@%s] topsearch da aniq match yo'q | users=%d | profil GET",
+        payload = _parse_json_body(search_resp)
+        if payload is None:
+            logger.warning(
+                "[@%s] topsearch JSON emas (HTTP %d) — profil GET",
                 username,
-                len(payload.get("users") or []) if isinstance(payload.get("users"), list) else 0,
+                search_status,
             )
+            return {"kind": "skip", "error": f"topsearch JSON emas (HTTP {search_status})"}
 
-            html_resp = await session.get(
-                profile_url,
-                headers=_PROFILE_HEADERS,
-                timeout=_REQUEST_TIMEOUT,
-                allow_redirects=True,
-                verify=False,
-                impersonate=_IMPERSONATE,
+        if _exact_username_in_search(payload, username):
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "topsearch"}
+
+        logger.debug(
+            "[@%s] topsearch da aniq match yo'q | users=%d | profil GET",
+            username,
+            len(payload.get("users") or []) if isinstance(payload.get("users"), list) else 0,
+        )
+        return {"kind": "continue"}
+
+    async def _try_profile_get(
+        self,
+        session: AsyncSession,
+        username: str,
+        profile_url: str,
+    ) -> dict[str, Any]:
+        """
+        kind=ok -> TAKEN
+        kind=continue -> 404/boshqa, check_username ga o't
+        kind=skip -> timeout/429/SSL — check_username ga o't
+        """
+        try:
+            html_resp = await self._request(session, "GET", profile_url, _PROFILE_HEADERS)
+        except _NETWORK_EXCEPTIONS as exc:
+            logger.warning("[@%s] profil GET tarmoq/timeout/SSL: %s — check_username", username, exc)
+            return {"kind": "skip", "error": f"{type(exc).__name__}: {exc}"}
+
+        if _is_wrong_origin(html_resp):
+            logger.warning("[@%s] profil GET noto'g'ri origin — check_username", username)
+            return {"kind": "skip", "error": "Proxy noto'g'ri origin (profile GET)"}
+
+        html_status = int(getattr(html_resp, "status_code", 0) or 0)
+        if html_status == 429:
+            logger.warning("[@%s] profil GET HTTP 429 — yangi IP + check_username", username)
+            return {"kind": "skip", "rate_limited": True, "error": "HTTP 429 Rate Limited (profile GET)"}
+
+        if html_status == 200:
+            return {
+                "kind": "ok",
+                "status": CheckStatus.TAKEN,
+                "source": "profile GET",
+                "response": html_resp,
+            }
+
+        logger.debug(
+            "[@%s] 1-bosqich o'tkazdi (HTTP %d) | check_username tasdiqlash",
+            username,
+            html_status,
+        )
+        return {"kind": "continue", "response": html_resp}
+
+    async def _finish_with_signup(
+        self,
+        username: str,
+        session: AsyncSession,
+        profile_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        if profile_result["kind"] == "ok":
+            return profile_result
+
+        if profile_result["kind"] == "continue":
+            classified = await self._signup_check_in_session(
+                session, username, profile_result.get("response")
             )
+            return await self._maybe_rotate_signup(username, classified)
 
-            if _is_wrong_origin(html_resp):
-                return {
-                    "kind": "retry",
-                    "rate_limited": False,
-                    "error": "Proxy noto'g'ri origin (profile GET)",
-                }
+        logger.info("[@%s] profil GET o'tkazildi, yangi IP bilan check_username", username)
+        return await self._maybe_rotate_signup(
+            username,
+            await self._signup_check_fresh(username, self._get_session_proxy()),
+        )
 
-            html_status = int(getattr(html_resp, "status_code", 0) or 0)
-            if html_status == 429:
-                return {
-                    "kind": "retry",
-                    "rate_limited": True,
-                    "error": "HTTP 429 Rate Limited (profile GET)",
-                }
-
-            if html_status == 200:
-                return {
-                    "kind": "ok",
-                    "status": CheckStatus.TAKEN,
-                    "source": "profile GET",
-                }
-
-            logger.debug(
-                "[@%s] 1-bosqich o'tkazdi (HTTP %d) | check_username tasdiqlash",
-                username,
-                html_status,
-            )
-
-            classified = await self._signup_check_in_session(session, username, html_resp)
-
+    async def _maybe_rotate_signup(
+        self,
+        username: str,
+        classified: dict[str, Any],
+    ) -> dict[str, Any]:
         if classified.get("rate_limited"):
-            new_proxy = self._get_session_proxy()
             logger.warning(
                 "[@%s] check_username HTTP 429 | yangi proxy IP, 1 marta qayta urinish",
                 username,
             )
-            return await self._signup_check_fresh(username, new_proxy)
-
+            return await self._signup_check_fresh(username, self._get_session_proxy())
         return classified
+
+    async def _funnel_check(
+        self,
+        username: str,
+        proxy: str | None,
+        skip_topsearch: bool = False,
+    ) -> dict[str, Any]:
+        """
+        1) topsearch / profil GET — band bo'lsa darhol TAKEN.
+        2) 404 / topilmagan — check_username POST (AVAILABLE faqat available=true).
+        topsearch timeout/429/SSL da ERROR qaytmaydi — keyingi bosqichga o'tadi.
+        """
+        search_url = _TOPSEARCH_URL.format(query=quote(username, safe="._"))
+        profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
+        current_proxy = proxy
+
+        if not skip_topsearch:
+            kwargs = self._session_kwargs(current_proxy)
+            async with AsyncSession(**kwargs) as session:
+                search_result = await self._try_topsearch(session, username, search_url)
+                if search_result["kind"] == "ok":
+                    return search_result
+                if search_result["kind"] == "continue":
+                    profile_result = await self._try_profile_get(session, username, profile_url)
+                    return await self._finish_with_signup(username, session, profile_result)
+
+            current_proxy = self._get_session_proxy()
+            logger.info("[@%s] topsearch o'tkazildi, yangi IP bilan profil GET", username)
+        else:
+            logger.info("[@%s] retry: topsearch o'tkazildi, profil GET", username)
+
+        kwargs = self._session_kwargs(current_proxy)
+        async with AsyncSession(**kwargs) as session:
+            profile_result = await self._try_profile_get(session, username, profile_url)
+            return await self._finish_with_signup(username, session, profile_result)
 
     async def _signup_check_fresh(
         self,
         username: str,
         proxy: str | None,
     ) -> dict[str, Any]:
-        """429 dan keyin yangi sessiya/IP bilan faqat check_username."""
+        """Yangi sessiya/IP bilan faqat check_username."""
         kwargs = self._session_kwargs(proxy)
         async with AsyncSession(**kwargs) as session:
             return await self._signup_check_in_session(session, username, None)
@@ -640,14 +716,17 @@ class InstagramChecker:
         username: str,
         prior_response: Any,
     ) -> dict[str, Any]:
-        signup_resp = await session.get(
-            _SIGNUP_URL,
-            headers=_SIGNUP_PAGE_HEADERS,
-            timeout=_REQUEST_TIMEOUT,
-            allow_redirects=True,
-            verify=False,
-            impersonate=_IMPERSONATE,
-        )
+        try:
+            signup_resp = await self._request(
+                session, "GET", _SIGNUP_URL, _SIGNUP_PAGE_HEADERS
+            )
+        except _NETWORK_EXCEPTIONS as exc:
+            logger.warning("[@%s] signup GET tarmoq/timeout/SSL: %s", username, exc)
+            return {
+                "kind": "retry",
+                "rate_limited": True,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
         if _is_wrong_origin(signup_resp):
             return {
@@ -669,15 +748,21 @@ class InstagramChecker:
             or _extract_csrftoken(prior_response, session)
             or secrets.token_hex(16)
         )
-        check_resp = await session.post(
-            _CHECK_USERNAME_URL,
-            data={"username": username},
-            headers=_check_username_headers(csrf),
-            timeout=_REQUEST_TIMEOUT,
-            allow_redirects=True,
-            verify=False,
-            impersonate=_IMPERSONATE,
-        )
+        try:
+            check_resp = await self._request(
+                session,
+                "POST",
+                _CHECK_USERNAME_URL,
+                _check_username_headers(csrf),
+                data={"username": username},
+            )
+        except _NETWORK_EXCEPTIONS as exc:
+            logger.warning("[@%s] check_username POST tarmoq/timeout/SSL: %s", username, exc)
+            return {
+                "kind": "retry",
+                "rate_limited": True,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
         if _is_wrong_origin(check_resp):
             return {
