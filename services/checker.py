@@ -36,6 +36,8 @@ _OEMBED_ENDPOINT = "https://www.instagram.com/api/v1/oembed/?url="
 _PROFILE_URL = "https://www.instagram.com/{username}/"
 
 _REQUEST_TIMEOUT = 6.0
+_PROFILE_TIMEOUT = 9.0
+_DIRECT_PROFILE_TIMEOUT = 7.0
 _IMPERSONATE = "chrome124"
 _CHROME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -165,10 +167,14 @@ class InstagramChecker:
     async def stop(self) -> None:
         logger.info("InstagramChecker to'xtatildi.")
 
-    def _session_kwargs(self, proxy: str | None) -> dict[str, Any]:
+    def _session_kwargs(
+        self,
+        proxy: str | None,
+        timeout: float = _REQUEST_TIMEOUT,
+    ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "impersonate": _IMPERSONATE,
-            "timeout": _REQUEST_TIMEOUT,
+            "timeout": timeout,
             "max_clients": 1,
             "verify": False,
             "allow_redirects": True,
@@ -243,13 +249,14 @@ class InstagramChecker:
         headers: dict[str, str],
         data: dict[str, str] | None = None,
         allow_redirects: bool = True,
+        timeout: float = _REQUEST_TIMEOUT,
     ) -> Any:
         request = session.post if method.upper() == "POST" else session.get
         return await request(
             url,
             headers=headers,
             data=data,
-            timeout=_REQUEST_TIMEOUT,
+            timeout=timeout,
             allow_redirects=allow_redirects,
             verify=False,
             impersonate=_IMPERSONATE,
@@ -284,56 +291,75 @@ class InstagramChecker:
         self,
         session: AsyncSession,
         username: str,
+        proxy: str | None,
     ) -> dict[str, Any]:
         profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
-        last_error: Exception | None = None
-        for attempt in range(2):
+        try:
+            response = await self._request(
+                session,
+                "GET",
+                profile_url,
+                _PROFILE_HEADERS,
+                timeout=_PROFILE_TIMEOUT,
+            )
+        except _NETWORK_EXCEPTIONS as proxy_error:
+            if not proxy:
+                return {
+                    "kind": "error",
+                    "error": f"profile check network error: {proxy_error}",
+                }
             try:
-                response = await self._request(
-                    session,
-                    "GET",
-                    profile_url,
-                    _PROFILE_HEADERS,
-                )
-            except _NETWORK_EXCEPTIONS as exc:
-                last_error = exc
-                continue
+                async with AsyncSession(
+                    **self._session_kwargs(None, _DIRECT_PROFILE_TIMEOUT)
+                ) as direct_session:
+                    response = await self._request(
+                        direct_session,
+                        "GET",
+                        profile_url,
+                        _PROFILE_HEADERS,
+                        timeout=_DIRECT_PROFILE_TIMEOUT,
+                    )
+            except _NETWORK_EXCEPTIONS as direct_error:
+                return {
+                    "kind": "error",
+                    "error": f"profile check proxy and direct requests failed: {direct_error}",
+                }
 
+        response_url = str(getattr(response, "url", ""))
+        if "checkpoint" in response_url or "challenge" in response_url:
+            try:
+                async with AsyncSession(
+                    **self._session_kwargs(None, _DIRECT_PROFILE_TIMEOUT)
+                ) as direct_session:
+                    response = await self._request(
+                        direct_session,
+                        "GET",
+                        profile_url,
+                        _PROFILE_HEADERS,
+                        timeout=_DIRECT_PROFILE_TIMEOUT,
+                    )
+            except _NETWORK_EXCEPTIONS as direct_error:
+                return {
+                    "kind": "error",
+                    "error": f"profile check proxy and direct requests failed: {direct_error}",
+                }
             response_url = str(getattr(response, "url", ""))
-            if "checkpoint" in response_url or "challenge" in response_url:
-                try:
-                    async with AsyncSession(**self._session_kwargs(None)) as direct_session:
-                        response = await self._request(
-                            direct_session,
-                            "GET",
-                            profile_url,
-                            _PROFILE_HEADERS,
-                        )
-                except _NETWORK_EXCEPTIONS as exc:
-                    last_error = exc
-                    continue
-                response_url = str(getattr(response, "url", ""))
 
-            raw_text = _body_text(response)
-            username_lower = username.lower()
+        raw_text = _body_text(response)
+        username_lower = username.lower()
 
-            if "/accounts/login/" in response_url:
-                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
-            if (
-                "Followers" in raw_text
-                or "og:description" in raw_text
-                or f"instagram://user?username={username_lower}" in raw_text
-            ):
-                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_active_meta"}
-            if username_lower in ("ziynat", "finhub.kz"):
-                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
+        if "/accounts/login/" in response_url:
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
+        if (
+            "Followers" in raw_text
+            or "og:description" in raw_text
+            or f"instagram://user?username={username_lower}" in raw_text
+        ):
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_active_meta"}
+        if username_lower in ("ziynat", "finhub.kz"):
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
 
-            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_empty"}
-
-        return {
-            "kind": "error",
-            "error": f"profile check network timeout after retry: {last_error}",
-        }
+        return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_empty"}
 
     async def _funnel_check(self, username: str, proxy: str | None) -> dict[str, Any]:
         kwargs = self._session_kwargs(proxy)
@@ -344,7 +370,7 @@ class InstagramChecker:
             if oembed["kind"] != "check_required":
                 return oembed
 
-            return await self._try_profile_check(session, username)
+            return await self._try_profile_check(session, username, proxy)
 
 
 instagram_checker = InstagramChecker()
