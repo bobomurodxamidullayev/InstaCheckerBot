@@ -337,13 +337,28 @@ class InstagramChecker:
 
         status_code = int(getattr(resp, "status_code", 0) or 0)
         html = _body_text(resp)
-        if status_code == 404 or "page not found" in html.lower():
-            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_404"}
-        if status_code == 200 and (
-            "followers" in html.lower() or "og:description" in html.lower()
+        html_lower = html.lower()
+        final_url = str(getattr(resp, "url", "") or "").lower()
+
+        if (
+            "- followers, " in html_lower
+            or f"(@{username.lower()})" in html_lower
+            or "edge_followed_by" in html_lower
         ):
             return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_active"}
-        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_deactive"}
+
+        if (
+            status_code == 404
+            or "<title>page not found" in html_lower
+            or "<title>instagram</title>" in html_lower
+            or "sorry, this page isn't available." in html_lower
+        ):
+            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_available"}
+
+        if "/accounts/login" in final_url or "/challenge" in final_url:
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_deactive"}
+
+        return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_available"}
 
     async def _funnel_check(self, username: str, proxy: str | None) -> dict[str, Any]:
         kwargs = self._session_kwargs(proxy)
