@@ -317,12 +317,17 @@ class InstagramChecker:
             return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
 
         if status_code in (301, 302) and any(
-            marker in location for marker in ("login", "checkpoint")
+            marker in location for marker in ("login", "challenge")
         ):
             return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
 
         if status_code == 404:
             return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_404"}
+
+        if status_code == 200:
+            if "Followers" in raw_text or "og:description" in raw_text:
+                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_active_meta"}
+            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_empty_200"}
 
         if "page not found" in body_lower or "the link you followed may be broken" in body_lower:
             return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "page_not_found"}
