@@ -372,7 +372,8 @@ def _html_is_page_not_found(html: str, status_code: int, final_url: str = "") ->
 def _signup_attempt_headers(csrf: str) -> dict[str, str]:
     """
     web_create_ajax/attempt/ uchun kerakli headerlar.
-    Referer: emailsignup sahifasi — Instagram validatsiyasi uchun muhim.
+    X-IG-App-ID + X-ASBD-ID bo'lmasa Instagram 429 qaytaradi.
+    Sec-Fetch-* — brauzer so'rovi ekanini tasdiqlovchi headerlar.
     """
     return {
         "User-Agent": (
@@ -384,10 +385,15 @@ def _signup_attempt_headers(csrf: str) -> dict[str, str]:
         "Content-Type": "application/x-www-form-urlencoded",
         "X-CSRFToken": csrf or "missing",
         "X-IG-App-ID": _IG_APP_ID,
+        "X-ASBD-ID": "129477",
         "X-Requested-With": "XMLHttpRequest",
+        "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
         "Referer": "https://www.instagram.com/accounts/emailsignup/",
         "Origin": "https://www.instagram.com",
     }
+
 
 
 def _signup_attempt_body(username: str) -> dict[str, str]:
@@ -796,10 +802,19 @@ class InstagramChecker:
         Profil GET natijasiga qarab:
         - ok      -> TAKEN qaytaradi
         - continue -> signup attempt POST bilan tasdiqlaydi
-        - skip    -> yangi IP bilan signup attempt POST
+        - skip    -> sticky IP bilan signup attempt POST
+
+        429 bo'lganda hech qachon ERROR berilmaydi:
+          profil HTML isbotlangan -> TAKEN
+          isbotlanmagan / 404     -> AVAILABLE (source=signup_429_fallback)
         """
         if profile_result["kind"] == "ok":
             return profile_result
+
+        # ── Profil HTML ma'lumotlari (fallback uchun) ──────────────────────────
+        prof_html: str = profile_result.get("html", "")
+        prof_status: int = profile_result.get("html_status", 0)
+        prof_final_url: str = profile_result.get("final_url", "")
 
         if profile_result["kind"] == "continue":
             prior_resp = profile_result.get("response")
@@ -813,34 +828,57 @@ class InstagramChecker:
                 )
                 classified = await self._signup_attempt_fresh(username, self._get_session_proxy())
 
-            # Fallback: signup attempt retry/429 + profil aniq 404 -> AVAILABLE (ERROR emas)
+            # Signup attempt retry/429 -> profil HTML ga tayanib yakuniy xulosa
             if classified["kind"] == "retry":
-                html = profile_result.get("html", "")
-                html_status = profile_result.get("html_status", 0)
-                final_url = profile_result.get("final_url", "")
-                if _html_is_page_not_found(html, html_status, final_url):
-                    logger.info(
-                        "[@%s] Fallback: signup API 429/xato + profil 404 -> AVAILABLE",
-                        username,
-                    )
-                    return {
-                        "kind": "ok",
-                        "status": CheckStatus.AVAILABLE,
-                        "source": "fallback_404",
-                    }
-                # Profil 404 emas (login redirect yoki boshqa) — retry davom etsin
-                logger.warning(
-                    "[@%s] signup attempt retry, profil 404 emas — keyingi urinish",
-                    username,
-                )
+                return self._resolve_by_profile_html(username, prof_html, prof_status, prof_final_url)
 
             return classified
 
         # kind=skip — profil GET timeout/429/SSL, sticky IP bilan signup attempt
         logger.info("[@%s] profil GET o'tkazildi, sticky IP bilan signup attempt", username)
-        fresh = await self._signup_attempt_fresh(username, self._get_session_proxy())
-        # Fresh attempt ham 429/retry bersa — retry qaytaramiz, loop yangi IP bilan qayta bajaradi
-        return fresh
+        classified = await self._signup_attempt_fresh(username, self._get_session_proxy())
+
+        # Fresh attempt retry/429 -> profil HTML ga tayanib yakuniy xulosa
+        if classified["kind"] == "retry":
+            return self._resolve_by_profile_html(username, prof_html, prof_status, prof_final_url)
+
+        return classified
+
+    def _resolve_by_profile_html(
+        self,
+        username: str,
+        html: str,
+        html_status: int,
+        final_url: str,
+    ) -> dict[str, Any]:
+        """
+        Signup attempt 429/retry bo'lganda yakuniy hakam sifatida profil
+        HTML ga tayanib AVAILABLE yoki TAKEN qaytaradi.
+
+        Qoida:
+          - Profil HTML da faol profil teglari (Followers/Posts/og:description)
+            100% isbotlansa -> TAKEN
+          - Aks holda (404, bo'sh, login redirect, marker yo'q) -> AVAILABLE
+            (source=signup_429_fallback)
+
+        Hech qachon ERROR qaytarmaydi.
+        """
+        # Profil HTML da qat'iy isbotlangan profil bor -> TAKEN
+        if html and _html_proves_existing_profile(html, username, final_url):
+            logger.info(
+                "[@%s] signup 429-fallback: profil HTML isbotladi -> TAKEN",
+                username,
+            )
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "signup_429_fallback"}
+
+        # 404 / login / marker yo'q -> AVAILABLE
+        logger.info(
+            "[@%s] signup 429-fallback: profil isbotlanmadi (status=%d) -> AVAILABLE",
+            username,
+            html_status,
+        )
+        return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "signup_429_fallback"}
+
 
     async def _signup_attempt_fresh(
         self,
