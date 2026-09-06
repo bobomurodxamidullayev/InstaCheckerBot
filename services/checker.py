@@ -1,13 +1,16 @@
 """
 services/checker.py — Instagram username tekshirish servisi.
 
-HTTP klient: curl_cffi.requests.AsyncSession (impersonate=chrome124).
-httpx o'rniga curl-impersonate ishlatiladi — VPS da SSL handshake
-failure va server tomonidagi TLS uzilishlarini bartaraf qilish uchun.
+Strategiya: profil sahifasi GET (registration POST API EMAS).
+  404          -> available
+  200 / 3xx    -> taken
+  429          -> yangi DataImpulse sessiya + exponential backoff
 
-VPS o'rnatish (venv ichida):
+Klient: curl_cffi AsyncSession (impersonate=chrome124, verify=False).
+Proxy HTTPS tunnel sertifikat nomlari mos kelmasa ham so'rov uzilmaydi.
+
+VPS:
     pip install "curl_cffi>=0.7.1"
-    # yoki butun loyiha:
     pip install -r requirements.txt
 """
 from __future__ import annotations
@@ -23,7 +26,19 @@ from urllib.parse import quote, unquote, urlparse, urlunparse
 
 from curl_cffi import CurlError
 from curl_cffi.requests import AsyncSession
-from curl_cffi.requests.exceptions import RequestException
+
+try:
+    from curl_cffi.requests.exceptions import RequestException
+except ImportError:  # pragma: no cover — versiya farqi
+    from curl_cffi.requests.errors import RequestsError as RequestException  # type: ignore
+
+try:
+    from curl_cffi.requests.exceptions import RequestsError
+except ImportError:  # pragma: no cover
+    try:
+        from curl_cffi.requests.errors import RequestsError  # type: ignore
+    except ImportError:
+        RequestsError = RequestException  # type: ignore
 
 from config import settings
 from models.username_log import CheckStatus
@@ -32,18 +47,29 @@ logger = logging.getLogger(__name__)
 
 # ─── Konstantlar ──────────────────────────────────────────────────────────────
 
-_SIGNUP_URL = "https://www.instagram.com/accounts/emailsignup/"
-_ATTEMPT_URL = "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
+_PROFILE_URL = "https://www.instagram.com/{username}/"
 _MAX_RETRIES = 3
-_REQUEST_TIMEOUT = 12.0  # soniya — qat'iy timeout (connect+read)
+_REQUEST_TIMEOUT = 12.0
 _IMPERSONATE = "chrome124"
 _BACKOFF_BASE = 2.0
 _BACKOFF_CAP = 30.0
+_CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
-# Impersonate Chrome 124 TLS fingerprintini beradi; UA ni qo'lda bermaymiz.
-_BASE_HEADERS: dict[str, str] = {
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+_PROFILE_HEADERS: dict[str, str] = {
+    "User-Agent": _CHROME_UA,
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
@@ -52,6 +78,7 @@ _BASE_HEADERS: dict[str, str] = {
 }
 
 _NETWORK_EXCEPTIONS = (
+    RequestsError,
     RequestException,
     CurlError,
     TimeoutError,
@@ -59,6 +86,8 @@ _NETWORK_EXCEPTIONS = (
     ConnectionError,
     OSError,
 )
+
+_USERNAME_RE = re.compile(r"^[a-z0-9._]{1,30}$")
 
 
 # ─── Natija dataclass ──────────────────────────────────────────────────────────
@@ -91,8 +120,8 @@ def _make_session_proxy(base_proxy: str | None) -> str | None:
     """
     DataImpulse rotating proxy: har urinishda yangi sessiya ID.
 
-    Kirish:  http://user:pass@gw.dataimpulse.com:823
-    Chiqish: http://user_session.{random_hex}:pass@gw.dataimpulse.com:823
+    Kirish:  http://{login}__cr.us:pass@gw.dataimpulse.com:823
+    Chiqish: http://{login}__cr.us_session.{hex}:pass@gw.dataimpulse.com:823
     """
     if not base_proxy:
         return None
@@ -113,9 +142,15 @@ def _make_session_proxy(base_proxy: str | None) -> str | None:
     if parsed.port:
         host = f"{host}:{parsed.port}"
 
-    netloc = f"{auth}@{host}"
     return urlunparse(
-        (parsed.scheme or "http", netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
+        (
+            parsed.scheme or "http",
+            f"{auth}@{host}",
+            parsed.path,
+            parsed.params,
+            parsed.query,
+            parsed.fragment,
+        )
     )
 
 
@@ -126,37 +161,107 @@ def _backoff_delay(attempt: int) -> float:
     return delay + random.uniform(0.15, 0.75)
 
 
-def _extract_csrftoken(response: Any) -> str | None:
-    cookies = getattr(response, "cookies", None)
-    if cookies is not None:
-        token = cookies.get("csrftoken")
-        if token:
-            return str(token)
-
-    headers = getattr(response, "headers", None)
+def _header_get(headers: Any, name: str) -> str:
     if not headers:
-        return None
+        return ""
+    try:
+        value = headers.get(name) or headers.get(name.lower()) or headers.get(name.title())
+    except Exception:
+        return ""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple)):
+        return " ".join(str(v) for v in value)
+    return str(value)
 
-    values: list[str] = []
-    getter = getattr(headers, "get_list", None)
-    if callable(getter):
-        values.extend(getter("set-cookie") or getter("Set-Cookie") or [])
-    else:
-        raw = headers.get("set-cookie") or headers.get("Set-Cookie")
-        if raw:
-            values.append(str(raw))
 
-    for value in values:
-        match = re.search(r"csrftoken=([^;]+)", value)
-        if match:
-            return match.group(1)
-    return None
+def _response_snippet(response: Any, limit: int = 800) -> str:
+    text = getattr(response, "text", None)
+    if isinstance(text, str) and text:
+        return text[:limit]
+    content = getattr(response, "content", b"")
+    if isinstance(content, (bytes, bytearray)):
+        try:
+            return bytes(content[:limit]).decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+    return str(content)[:limit]
+
+
+def _is_wrong_origin(response: Any) -> bool:
+    """
+    verify=False tufayli proxy Google (yoki boshqa host) sertifikatini
+    o'tkazib yuborsa, javob Instagram emas — qayta urinish kerak.
+    """
+    final_url = str(getattr(response, "url", "") or "").lower()
+    location = _header_get(getattr(response, "headers", None), "location").lower()
+    snippet = _response_snippet(response).lower()
+    server = _header_get(getattr(response, "headers", None), "server").lower()
+
+    google_marks = (
+        "www.google.com" in final_url,
+        "google.com/" in location,
+        "accounts.google" in location,
+        "sorry/index" in snippet,
+        "<title>google</title>" in snippet,
+        "gws" == server,
+    )
+    if any(google_marks):
+        return True
+
+    if snippet and "instagram" not in snippet and "meta" in snippet:
+        if "og:site_name" in snippet and "instagram" not in snippet:
+            return True
+    return False
+
+
+def _classify_profile_status(status_code: int, location: str) -> tuple[str, Any]:
+    """
+    HTTP status -> (kind, payload).
+    kind: ok | retry
+    """
+    if status_code == 429:
+        return "retry", {
+            "rate_limited": True,
+            "error": "HTTP 429 Rate Limited (profile GET)",
+        }
+
+    if status_code in (404, 410):
+        return "ok", CheckStatus.AVAILABLE
+
+    if status_code in (200, 201):
+        return "ok", CheckStatus.TAKEN
+
+    if 300 <= status_code < 400:
+        # login / consent / accounts redirect = band profil
+        return "ok", CheckStatus.TAKEN
+
+    if status_code in (401, 403):
+        # login wall ba'zan 403 — odatda band username
+        loc = location.lower()
+        if "login" in loc or "accounts" in loc or "consent" in loc:
+            return "ok", CheckStatus.TAKEN
+        return "retry", {
+            "rate_limited": False,
+            "error": f"HTTP {status_code} (blocked)",
+        }
+
+    if status_code >= 500:
+        return "retry", {
+            "rate_limited": False,
+            "error": f"HTTP {status_code} (server)",
+        }
+
+    return "retry", {
+        "rate_limited": False,
+        "error": f"Kutilmagan HTTP {status_code}",
+    }
 
 
 # ─── Asosiy tekshiruvchi sinf ──────────────────────────────────────────────────
 
 class InstagramChecker:
-    """Instagram username mavjudligini curl_cffi orqali tekshiruvchi sinf."""
+    """Instagram username mavjudligini profil GET orqali tekshiruvchi sinf."""
 
     def __init__(self, proxy_url: str | None = None) -> None:
         self._base_proxy: str | None = proxy_url or (
@@ -164,7 +269,7 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | client=curl_cffi/%s",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | client=curl_cffi/%s | verify=off",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
             _IMPERSONATE,
@@ -172,7 +277,7 @@ class InstagramChecker:
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (curl_cffi) | proxy=%s",
+            "InstagramChecker ishga tushdi (profile GET, curl_cffi) | proxy=%s",
             bool(self._base_proxy),
         )
 
@@ -181,6 +286,19 @@ class InstagramChecker:
 
     def _get_session_proxy(self) -> str | None:
         return _make_session_proxy(self._base_proxy)
+
+    def _session_kwargs(self, proxy: str | None) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "impersonate": _IMPERSONATE,
+            "timeout": _REQUEST_TIMEOUT,
+            "max_clients": 1,
+            "verify": False,
+            "allow_redirects": False,
+            "headers": _PROFILE_HEADERS,
+        }
+        if proxy:
+            kwargs["proxy"] = proxy
+        return kwargs
 
     async def check_username(
         self,
@@ -191,10 +309,18 @@ class InstagramChecker:
         Username holatini tekshiradi.
 
         Qaytadi: CheckResult (status / username / error_message).
-        Dict kerak bo'lsa: result.to_dict()
+        Dict: result.to_dict()
           {"status": "available"|"taken"|"error", "username": ..., "error": str|None}
         """
         username_clean = username.strip().lstrip("@").lower()
+
+        if not _USERNAME_RE.fullmatch(username_clean):
+            return CheckResult(
+                username=username_clean,
+                status=CheckStatus.ERROR,
+                error_message="Noto'g'ri username formati",
+                attempts=0,
+            )
 
         if username_clean in self._checking_usernames:
             logger.warning(
@@ -210,90 +336,99 @@ class InstagramChecker:
 
         self._checking_usernames.add(username_clean)
         try:
-            last_error = "Noma'lum xato"
-
-            for attempt in range(1, max_retries + 1):
-                session_proxy = self._get_session_proxy()
-                logger.debug("[@%s] Urinish %d/%d", username_clean, attempt, max_retries)
-
-                if attempt == 1:
-                    await asyncio.sleep(
-                        random.uniform(settings.check_delay_min, settings.check_delay_max)
-                    )
-                else:
-                    await asyncio.sleep(random.uniform(0.4, 1.0))
-
-                try:
-                    result = await self._attempt_check(
-                        username_clean, session_proxy
-                    )
-                except _NETWORK_EXCEPTIONS as exc:
-                    last_error = f"{type(exc).__name__}: {exc}"
-                    logger.warning(
-                        "[@%s] Tarmoq/SSL xatosi [%s] (urinish %d/%d): %s",
-                        username_clean,
-                        type(exc).__name__,
-                        attempt,
-                        max_retries,
-                        exc,
-                    )
-                    continue
-                except Exception as exc:
-                    last_error = f"{type(exc).__name__}: {exc}"
-                    logger.warning(
-                        "[@%s] Kutilmagan xato [%s] (urinish %d/%d): %s",
-                        username_clean,
-                        type(exc).__name__,
-                        attempt,
-                        max_retries,
-                        exc,
-                    )
-                    continue
-
-                if result["kind"] == "ok":
-                    status = result["status"]
-                    logger.info("[@%s] %s", username_clean, status.value)
-                    return CheckResult(
-                        username=username_clean,
-                        status=status,
-                        attempts=attempt,
-                    )
-
-                last_error = result["error"]
-                if result.get("rate_limited"):
-                    delay = _backoff_delay(attempt)
-                    logger.warning(
-                        "[@%s] HTTP 429 | backoff %.1fs | urinish %d/%d",
-                        username_clean,
-                        delay,
-                        attempt,
-                        max_retries,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-
-                logger.warning(
-                    "[@%s] %s (urinish %d/%d)",
-                    username_clean,
-                    last_error,
-                    attempt,
-                    max_retries,
-                )
-
-            logger.error(
-                "[@%s] Barcha %d urinish muvaffaqiyatsiz | Oxirgi xato: %s",
-                username_clean,
-                max_retries,
-                last_error,
-            )
+            return await self._check_with_retries(username_clean, max_retries)
+        except Exception as exc:
+            logger.exception("[@%s] Event loop xavfsizligi: ushlanmagan xato", username_clean)
             return CheckResult(
                 username=username_clean,
                 status=CheckStatus.ERROR,
-                error_message=last_error,
+                error_message=f"{type(exc).__name__}: {exc}",
                 attempts=max_retries,
             )
         finally:
             self._checking_usernames.discard(username_clean)
+
+    async def _check_with_retries(self, username: str, max_retries: int) -> CheckResult:
+        last_error = "Noma'lum xato"
+
+        for attempt in range(1, max_retries + 1):
+            session_proxy = self._get_session_proxy()
+            logger.debug("[@%s] Urinish %d/%d | yangi proxy sessiya", username, attempt, max_retries)
+
+            if attempt == 1:
+                await asyncio.sleep(
+                    random.uniform(settings.check_delay_min, settings.check_delay_max)
+                )
+            else:
+                await asyncio.sleep(random.uniform(0.35, 0.9))
+
+            try:
+                result = await self._attempt_check(username, session_proxy)
+            except _NETWORK_EXCEPTIONS as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "[@%s] Tarmoq/SSL xatosi [%s] (urinish %d/%d): %s",
+                    username,
+                    type(exc).__name__,
+                    attempt,
+                    max_retries,
+                    exc,
+                )
+                continue
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "[@%s] Kutilmagan xato [%s] (urinish %d/%d): %s",
+                    username,
+                    type(exc).__name__,
+                    attempt,
+                    max_retries,
+                    exc,
+                )
+                continue
+
+            if result["kind"] == "ok":
+                status: CheckStatus = result["status"]
+                logger.info("[@%s] %s (HTTP profile)", username, status.value)
+                return CheckResult(
+                    username=username,
+                    status=status,
+                    attempts=attempt,
+                )
+
+            last_error = str(result.get("error") or last_error)
+            if result.get("rate_limited"):
+                delay = _backoff_delay(attempt)
+                logger.warning(
+                    "[@%s] HTTP 429 | backoff %.1fs | urinish %d/%d",
+                    username,
+                    delay,
+                    attempt,
+                    max_retries,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            logger.warning(
+                "[@%s] %s (urinish %d/%d)",
+                username,
+                last_error,
+                attempt,
+                max_retries,
+            )
+
+        logger.error(
+            "[@%s] Barcha %d urinish muvaffaqiyatsiz | Oxirgi xato: %s",
+            username,
+            max_retries,
+            last_error,
+        )
+        return CheckResult(
+            username=username,
+            status=CheckStatus.ERROR,
+            error_message=last_error,
+            attempts=max_retries,
+        )
 
     async def _attempt_check(
         self,
@@ -301,99 +436,46 @@ class InstagramChecker:
         proxy: str | None,
     ) -> dict[str, Any]:
         """
-        Bitta proxy sessiyasi bilan GET (csrf) + POST (attempt).
-        Istisnolar tashqariga chiqadi — chaqiruvchi ushlaydi.
+        Bitta yangi proxy sessiya + bitta profil GET.
+        Istisnolar chaqiruvchiga chiqadi.
         """
-        session_kwargs: dict[str, Any] = {
-            "impersonate": _IMPERSONATE,
-            "timeout": _REQUEST_TIMEOUT,
-            "max_clients": 1,
-        }
-        if proxy:
-            session_kwargs["proxy"] = proxy
+        url = _PROFILE_URL.format(username=quote(username, safe="._"))
+        kwargs = self._session_kwargs(proxy)
 
-        async with AsyncSession(**session_kwargs) as session:
-            resp_get = await session.get(_SIGNUP_URL, headers=_BASE_HEADERS)
-
-            if resp_get.status_code == 429:
-                return {
-                    "kind": "retry",
-                    "rate_limited": True,
-                    "error": "HTTP 429 Rate Limited (GET)",
-                }
-
-            csrftoken = _extract_csrftoken(resp_get)
-            if not csrftoken:
-                jar = getattr(session, "cookies", None)
-                if jar is not None:
-                    csrftoken = jar.get("csrftoken")
-
-            if not csrftoken:
-                return {
-                    "kind": "retry",
-                    "rate_limited": False,
-                    "error": "csrftoken topilmadi",
-                }
-
-            post_headers = {
-                "Accept": "*/*",
-                "Accept-Language": "en-US,en;q=0.9",
-                "X-CSRFToken": str(csrftoken),
-                "X-Requested-With": "XMLHttpRequest",
-                "Referer": _SIGNUP_URL,
-                "Origin": "https://www.instagram.com",
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Sec-Fetch-Dest": "empty",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Site": "same-origin",
-            }
-
-            form_data = {
-                "email": f"test{random.randint(100000, 999999)}@gmail.com",
-                "username": username,
-                "first_name": "Tester",
-                "opt_into_one_tap": "false",
-            }
-
-            resp_post = await session.post(
-                _ATTEMPT_URL,
-                data=form_data,
-                headers=post_headers,
+        async with AsyncSession(**kwargs) as session:
+            response = await session.get(
+                url,
+                headers=_PROFILE_HEADERS,
+                timeout=_REQUEST_TIMEOUT,
+                allow_redirects=False,
+                verify=False,
             )
 
-            status_code = resp_post.status_code
-            logger.debug("[@%s] POST HTTP %d", username, status_code)
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        location = _header_get(getattr(response, "headers", None), "location")
+        logger.debug(
+            "[@%s] GET %s -> HTTP %d loc=%s",
+            username,
+            url,
+            status_code,
+            location[:120] if location else "-",
+        )
 
-            if status_code == 429:
-                return {
-                    "kind": "retry",
-                    "rate_limited": True,
-                    "error": "HTTP 429 Rate Limited (POST)",
-                }
-
-            try:
-                json_data = resp_post.json()
-            except Exception as exc:
-                return {
-                    "kind": "retry",
-                    "rate_limited": False,
-                    "error": f"JSON tahlil xatosi: {exc} (HTTP {status_code})",
-                }
-
-            username_is_taken = bool(json_data.get("username_is_taken", False))
-            errors = json_data.get("errors") or {}
-
-            if username_is_taken or "username" in errors:
-                return {"kind": "ok", "status": CheckStatus.TAKEN}
-
-            if status_code == 200 and "username" not in errors:
-                return {"kind": "ok", "status": CheckStatus.AVAILABLE}
-
+        if _is_wrong_origin(response):
             return {
                 "kind": "retry",
                 "rate_limited": False,
-                "error": f"Kutilmagan JSON javob: {json_data}",
+                "error": "Proxy noto'g'ri origin (Google/boshqa host) qaytardi",
             }
+
+        kind, payload = _classify_profile_status(status_code, location)
+        if kind == "ok":
+            return {"kind": "ok", "status": payload}
+        return {
+            "kind": "retry",
+            "rate_limited": bool(payload.get("rate_limited")),
+            "error": payload.get("error"),
+        }
 
 
 instagram_checker = InstagramChecker()
