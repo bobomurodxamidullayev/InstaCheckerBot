@@ -33,9 +33,10 @@ from models.username_log import CheckStatus
 logger = logging.getLogger(__name__)
 
 _OEMBED_URL = "https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/{username}/"
-_PROFILE_URL = "https://www.instagram.com/{username}/"
+_SIGNUP_PAGE_URL = "https://www.instagram.com/accounts/emailsignup/"
+_CHECK_USERNAME_URL = "https://www.instagram.com/api/v1/web/accounts/check_username/"
 
-_REQUEST_TIMEOUT = 20.0
+_REQUEST_TIMEOUT = 6.0
 _IMPERSONATE = "chrome124"
 _CHROME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -47,10 +48,19 @@ _OEMBED_HEADERS: dict[str, str] = {
     "Accept": "application/json",
 }
 
-_WEB_PROFILE_HEADERS: dict[str, str] = {
+_SIGNUP_PAGE_HEADERS: dict[str, str] = {
     "User-Agent": _CHROME_USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+}
+
+_CHECK_USERNAME_HEADERS: dict[str, str] = {
+    "User-Agent": _CHROME_USER_AGENT,
+    "X-IG-App-ID": "936619743392459",
+    "X-ASBD-ID": "129477",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": _SIGNUP_PAGE_URL,
+    "Content-Type": "application/x-www-form-urlencoded",
 }
 
 _NETWORK_EXCEPTIONS = (
@@ -151,14 +161,14 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=oembed+web_profile",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=oembed+signup_check",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
         )
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (oEmbed + web_profile) | proxy=%s",
+            "InstagramChecker ishga tushdi (oEmbed + signup_check) | proxy=%s",
             bool(self._base_proxy),
         )
 
@@ -273,8 +283,8 @@ class InstagramChecker:
             resp = await self._request(session, "GET", oembed_url, _OEMBED_HEADERS)
         except _NETWORK_EXCEPTIONS as exc:
             return {
-                "kind": "error",
-                "error": f"oEmbed network error: {exc}",
+                "kind": "check_required",
+                "error": f"oEmbed unavailable; proceeding to signup check: {exc}",
             }
 
         status_code = int(getattr(resp, "status_code", 0) or 0)
@@ -287,79 +297,62 @@ class InstagramChecker:
             return {"kind": "check_required", "error": "oEmbed profile not found"}
         return {"kind": "error", "error": f"oEmbed unexpected status: {status_code}"}
 
-    async def _try_profile_page(
+    async def _try_signup_check(
         self,
         session: AsyncSession,
         username: str,
         proxy: str | None,
     ) -> dict[str, Any]:
-        profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
-        headers = {
-            **_WEB_PROFILE_HEADERS,
-            "Referer": f"https://www.instagram.com/{username}/",
-        }
-        response: Any = None
-        last_error: Exception | None = None
-        for attempt in range(3):
-            try:
-                if attempt == 0:
-                    response = await self._request(
-                        session,
-                        "GET",
-                        profile_url,
-                        headers,
-                        allow_redirects=False,
-                    )
-                else:
-                    retry_proxy = proxy if attempt == 1 else None
-                    fresh_kwargs = self._session_kwargs(retry_proxy)
-                    async with AsyncSession(**fresh_kwargs) as fresh_session:
-                        response = await self._request(
-                            fresh_session,
-                            "GET",
-                            profile_url,
-                            headers,
-                            allow_redirects=False,
-                        )
-                break
-            except _NETWORK_EXCEPTIONS as exc:
-                last_error = exc
-                if attempt < 2:
-                    await asyncio.sleep(0.5)
-                    continue
+        try:
+            signup_page = await self._request(
+                session,
+                "GET",
+                _SIGNUP_PAGE_URL,
+                _SIGNUP_PAGE_HEADERS,
+            )
+            csrf_token = session.cookies.get("csrftoken") or ""
+            if not csrf_token:
+                set_cookie = str(getattr(signup_page, "headers", {}).get("Set-Cookie", ""))
+                match = re.search(r"(?:^|;\s*)csrftoken=([^;]+)", set_cookie)
+                csrf_token = match.group(1) if match else ""
+
+            headers = {**_CHECK_USERNAME_HEADERS, "X-CSRFToken": csrf_token}
+            for attempt in range(2):
+                response = await self._request(
+                    session,
+                    "POST",
+                    _CHECK_USERNAME_URL,
+                    headers,
+                    data={"username": username},
+                )
+                status_code = int(getattr(response, "status_code", 0) or 0)
+                raw_text = _body_text(response)
+                payload = _parse_json_body(response)
+                if status_code == 429 or "rate limit" in raw_text.lower():
+                    if attempt == 0:
+                        await asyncio.sleep(0.5)
+                        continue
+                    return {
+                        "kind": "error",
+                        "retries_exhausted": True,
+                        "error": "signup username check rate-limited",
+                    }
+                if payload and payload.get("available") is True:
+                    return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "signup_available"}
+                if (
+                    payload
+                    and (payload.get("available") is False or payload.get("status") == "fail")
+                ) or "username_is_taken" in raw_text:
+                    return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "signup_taken_or_banned"}
                 return {
                     "kind": "error",
-                    "retries_exhausted": True,
-                    "error": f"profile page network error after 3 attempts: {last_error}",
+                    "error": f"signup username check inconclusive: status={status_code}",
                 }
-
-        status_code = int(getattr(response, "status_code", 0) or 0)
-        raw_text = _body_text(response)
-        body_lower = raw_text.lower()
-        location = str(getattr(response, "headers", {}).get("Location", "") or "").lower()
-        if username == "ziynat" or "checkpoint_required" in body_lower:
-            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
-
-        if status_code in (301, 302) and any(
-            marker in location for marker in ("login", "challenge")
-        ):
-            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
-
-        if status_code == 404:
-            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_404"}
-
-        if status_code == 200:
-            if "Followers" in raw_text or "og:description" in raw_text:
-                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_active_meta"}
-            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_empty_200"}
-
-        if "page not found" in body_lower or "the link you followed may be broken" in body_lower:
-            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "page_not_found"}
-
-        return {
-            "kind": "error",
-            "error": f"profile page inconclusive: status={status_code}",
-        }
+        except _NETWORK_EXCEPTIONS as exc:
+            return {
+                "kind": "error",
+                "error": f"signup username check network error: {exc}",
+            }
 
     async def _funnel_check(self, username: str, proxy: str | None) -> dict[str, Any]:
         kwargs = self._session_kwargs(proxy)
@@ -370,7 +363,8 @@ class InstagramChecker:
             if oembed["kind"] != "check_required":
                 return oembed
 
-            return await self._try_profile_page(session, username, proxy)
+            return await self._try_signup_check(session, username, proxy)
 
 
 instagram_checker = InstagramChecker()
+
