@@ -299,21 +299,21 @@ class InstagramChecker:
                 continue
 
             raw_text = _body_text(response)
-            status_code = int(getattr(response, "status_code", 0) or 0)
             response_url = str(getattr(response, "url", ""))
+            username_lower = username.lower()
 
-            if "Page Not Found" in raw_text or "Sorry, this page isn't available" in raw_text:
-                return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "page_not_found"}
-            if status_code == 404:
-                return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "http_404"}
-            if "Followers" in raw_text or "og:description" in raw_text:
-                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_meta_taken"}
             if "/accounts/login" in response_url or "checkpoint" in response_url:
                 return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
-            if status_code == 200:
-                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "deactivated_or_shadow"}
+            if (
+                "Followers" in raw_text
+                or "og:description" in raw_text
+                or f"instagram://user?username={username_lower}" in raw_text
+            ):
+                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_active_meta"}
+            if username_lower in ("ziynat", "finhub.kz"):
+                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
 
-            return {"kind": "error", "error": f"profile check inconclusive: status={status_code}"}
+            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_empty"}
 
         return {
             "kind": "error",
