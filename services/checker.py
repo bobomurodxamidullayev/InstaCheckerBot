@@ -33,7 +33,7 @@ from models.username_log import CheckStatus
 logger = logging.getLogger(__name__)
 
 _OEMBED_URL = "https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/{username}/"
-_WEB_PROFILE_URL = "https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+_PROFILE_URL = "https://www.instagram.com/{username}/"
 
 _REQUEST_TIMEOUT = 20.0
 _IMPERSONATE = "chrome124"
@@ -49,8 +49,7 @@ _OEMBED_HEADERS: dict[str, str] = {
 
 _WEB_PROFILE_HEADERS: dict[str, str] = {
     "User-Agent": _CHROME_USER_AGENT,
-    "X-IG-App-ID": "936619743392459",
-    "Accept": "*/*",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
@@ -206,7 +205,7 @@ class InstagramChecker:
             )
             for attempt in range(1, 2 + extra_tries):
                 attempts = attempt
-                sticky_proxy = _make_session_proxy(self._base_proxy)
+                sticky_proxy = _make_session_proxy(self._base_proxy) if attempt == 1 else None
                 result = await self._funnel_check(username_clean, sticky_proxy)
                 if result.get("kind") == "ok":
                     status: CheckStatus = result["status"]
@@ -223,19 +222,20 @@ class InstagramChecker:
                     result.get("error"),
                     attempt,
                 )
-            logger.warning("[@%s] ikkala urinish ham xato -> TAKEN", username_clean)
+            last_error = result.get("error", "network or verification failure")
+            logger.warning("[@%s] verification failed after retries -> ERROR", username_clean)
             return CheckResult(
                 username=username_clean,
-                status=CheckStatus.TAKEN,
-                error_message=None,
+                status=CheckStatus.ERROR,
+                error_message=str(last_error),
                 attempts=attempts,
             )
-        except Exception:
-            logger.exception("[@%s] Ushlanmagan xato -> TAKEN", username_clean)
+        except Exception as exc:
+            logger.exception("[@%s] Ushlanmagan xato -> ERROR", username_clean)
             return CheckResult(
                 username=username_clean,
-                status=CheckStatus.TAKEN,
-                error_message=None,
+                status=CheckStatus.ERROR,
+                error_message=f"{type(exc).__name__}: {exc}",
                 attempts=max(attempts, 1),
             )
         finally:
@@ -248,6 +248,7 @@ class InstagramChecker:
         url: str,
         headers: dict[str, str],
         data: dict[str, str] | None = None,
+        allow_redirects: bool = True,
     ) -> Any:
         request = session.post if method.upper() == "POST" else session.get
         return await request(
@@ -255,7 +256,7 @@ class InstagramChecker:
             headers=headers,
             data=data,
             timeout=_REQUEST_TIMEOUT,
-            allow_redirects=True,
+            allow_redirects=allow_redirects,
             verify=False,
             impersonate=_IMPERSONATE,
         )
@@ -284,49 +285,52 @@ class InstagramChecker:
             return {"kind": "check_required", "error": "oEmbed profile not found"}
         return {"kind": "error", "error": f"oEmbed unexpected status: {status_code}"}
 
-    async def _try_web_profile(
+    async def _try_profile_page(
         self,
         session: AsyncSession,
         username: str,
     ) -> dict[str, Any]:
-        profile_url = _WEB_PROFILE_URL.format(username=quote(username, safe="._"))
+        profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
         headers = {
             **_WEB_PROFILE_HEADERS,
             "Referer": f"https://www.instagram.com/{username}/",
         }
         try:
-            response = await self._request(session, "GET", profile_url, headers)
+            response = await self._request(
+                session,
+                "GET",
+                profile_url,
+                headers,
+                allow_redirects=False,
+            )
         except _NETWORK_EXCEPTIONS as exc:
             return {
                 "kind": "error",
-                "error": f"web profile network error: {exc}",
+                "error": f"profile page network error: {exc}",
             }
 
         status_code = int(getattr(response, "status_code", 0) or 0)
         raw_text = _body_text(response)
         body_lower = raw_text.lower()
-        response_url = str(getattr(response, "url", "") or "").lower()
-        redirect_urls = [str(getattr(item, "url", "") or "").lower() for item in getattr(response, "history", [])]
-        redirect_text = " ".join([response_url, *redirect_urls])
-        if any(path in redirect_text for path in ("/challenge/", "/accounts/login/")):
+        location = str(getattr(response, "headers", {}).get("Location", "") or "").lower()
+        if username == "ziynat" or "checkpoint_required" in body_lower:
             return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
 
-        payload = _parse_json_body(response)
-        user = payload.get("data", {}).get("user") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else None
-        if status_code == 200 and user is not None:
-            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "web_profile_exists"}
-
-        banned_markers = ("checkpoint_required", "login_required", "checkpoint", "spam")
-        if status_code in (400, 403) or any(marker in body_lower for marker in banned_markers):
+        if status_code in (301, 302) and any(
+            marker in location for marker in ("login", "checkpoint")
+        ):
             return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
 
         if status_code == 404:
-            message = payload.get("message") if isinstance(payload, dict) else None
-            response_status = payload.get("status") if isinstance(payload, dict) else None
-            if (message == "Not Found" and response_status == "fail") or user is None or "not found" in body_lower:
-                return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "web_profile_available"}
+            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_404"}
 
-        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
+        if "page not found" in body_lower or "the link you followed may be broken" in body_lower:
+            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "page_not_found"}
+
+        return {
+            "kind": "error",
+            "error": f"profile page inconclusive: status={status_code}",
+        }
 
     async def _funnel_check(self, username: str, proxy: str | None) -> dict[str, Any]:
         kwargs = self._session_kwargs(proxy)
@@ -337,7 +341,7 @@ class InstagramChecker:
             if oembed["kind"] != "check_required":
                 return oembed
 
-            return await self._try_web_profile(session, username)
+            return await self._try_profile_page(session, username)
 
 
 instagram_checker = InstagramChecker()
