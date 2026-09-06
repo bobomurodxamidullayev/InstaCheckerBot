@@ -37,10 +37,8 @@ from models.username_log import CheckStatus
 
 logger = logging.getLogger(__name__)
 
-_TOPSEARCH_URL = (
-    "https://www.instagram.com/web/search/topsearch/?context=blended&query={query}"
-)
 _ANDROID_CHECK_USERNAME_URL = "https://i.instagram.com/api/v1/users/check_username/"
+_PROFILE_URL = "https://www.instagram.com/{username}/"
 
 _REQUEST_TIMEOUT = 20.0
 _IMPERSONATE = "chrome120"
@@ -56,6 +54,12 @@ _JSON_HEADERS: dict[str, str] = {
     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     "X-IG-App-ID": "936619743392459",
     "X-FB-HTTP-Engine": "Liger",
+}
+
+_PROFILE_HEADERS: dict[str, str] = {
+    "User-Agent": _ANDROID_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US",
 }
 
 _NETWORK_EXCEPTIONS = (
@@ -117,20 +121,6 @@ def _make_session_proxy(base_proxy: str | None) -> str | None:
     ))
 
 
-def _header_get(headers: Any, name: str) -> str:
-    if not headers:
-        return ""
-    try:
-        value = headers.get(name) or headers.get(name.lower()) or headers.get(name.title())
-    except Exception:
-        return ""
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple)):
-        return " ".join(str(v) for v in value)
-    return str(value)
-
-
 def _body_text(response: Any) -> str:
     text = getattr(response, "text", None)
     if isinstance(text, str):
@@ -161,37 +151,6 @@ def _parse_json_body(response: Any) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _is_wrong_origin(response: Any) -> bool:
-    final_url = str(getattr(response, "url", "") or "").lower()
-    location = _header_get(getattr(response, "headers", None), "location").lower()
-    snippet = _body_text(response)[:800].lower()
-    server = _header_get(getattr(response, "headers", None), "server").lower()
-    return any((
-        "www.google.com" in final_url,
-        "google.com/" in location,
-        "accounts.google" in location,
-        "sorry/index" in snippet,
-        "<title>google</title>" in snippet,
-        server == "gws",
-    ))
-
-
-def _exact_username_in_search(payload: dict[str, Any], username: str) -> bool:
-    users = payload.get("users")
-    if not isinstance(users, list):
-        return False
-    target = username.lower()
-    for item in users:
-        if not isinstance(item, dict):
-            continue
-        user = item.get("user")
-        if not isinstance(user, dict):
-            continue
-        if str(user.get("username") or "").strip().lower() == target:
-            return True
-    return False
-
-
 def _is_timeout_exception(exc: BaseException) -> bool:
     return isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or (
         "timeout" in type(exc).__name__.lower()
@@ -202,7 +161,7 @@ def _classify_android_response(
     status_code: int,
     payload: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Classify only explicit native JSON signals; everything else is fallback."""
+    """Classify native JSON signals without treating missing data as available."""
     if status_code == 429:
         return {"kind": "fallback", "error": "HTTP 429 Rate Limited"}
 
@@ -215,8 +174,7 @@ def _classify_android_response(
     if payload.get("available") is False:
         return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "android_taken"}
 
-    error = str(payload.get("error") or payload.get("error_type") or "").lower()
-    if error == "username_is_taken" or payload.get("status") == "fail":
+    if "error" in payload or payload.get("status") == "fail":
         return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "android_taken"}
 
     return {"kind": "safe_taken", "error": "native response is ambiguous"}
@@ -353,31 +311,39 @@ class InstagramChecker:
                 data={"username": username},
             )
         except _NETWORK_EXCEPTIONS as exc:
-            if _is_timeout_exception(exc):
-                return {"kind": "fallback", "error": f"native timeout: {exc}"}
-            return {"kind": "safe_taken", "error": f"native network error: {exc}"}
+            error_kind = "timeout" if _is_timeout_exception(exc) else "network"
+            return {"kind": "fallback", "error": f"native {error_kind}: {exc}"}
 
         return _classify_android_response(
             int(getattr(resp, "status_code", 0) or 0),
             _parse_json_body(resp),
         )
 
-    async def _try_topsearch(
+    async def _try_profile(
         self,
         session: AsyncSession,
         username: str,
     ) -> dict[str, Any]:
-        search_url = _TOPSEARCH_URL.format(query=quote(username, safe="._"))
+        profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
         try:
-            resp = await self._request(session, "GET", search_url, _JSON_HEADERS)
+            resp = await self._request(session, "GET", profile_url, _PROFILE_HEADERS)
         except _NETWORK_EXCEPTIONS as exc:
-            return {"kind": "safe_taken", "error": f"topsearch network error: {exc}"}
+            return {
+                "kind": "ok",
+                "status": CheckStatus.TAKEN,
+                "source": "profile_deactive",
+                "error": f"profile network error: {exc}",
+            }
 
         status_code = int(getattr(resp, "status_code", 0) or 0)
-        payload = _parse_json_body(resp)
-        if payload and _exact_username_in_search(payload, username):
-            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "topsearch"}
-        return {"kind": "safe_taken", "error": f"topsearch ambiguous HTTP {status_code}"}
+        html = _body_text(resp)
+        if status_code == 404 or "page not found" in html.lower():
+            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_404"}
+        if status_code == 200 and (
+            "followers" in html.lower() or "og:description" in html.lower()
+        ):
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_active"}
+        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_deactive"}
 
     async def _funnel_check(self, username: str, proxy: str | None) -> dict[str, Any]:
         kwargs = self._session_kwargs(proxy)
@@ -386,7 +352,7 @@ class InstagramChecker:
             if native["kind"] == "ok":
                 return native
             if native["kind"] == "fallback":
-                return await self._try_topsearch(session, username)
+                return await self._try_profile(session, username)
             return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_fallback"}
 
 
