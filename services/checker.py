@@ -1,7 +1,7 @@
 """Instagram username tekshirish servisi.
 
-oEmbed identifies active accounts; a redirect-aware profile request handles
-the remaining 404 case.
+oEmbed identifies active accounts; the native mobile endpoint handles the
+remaining 404 case without web redirects or HTML parsing.
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ from models.username_log import CheckStatus
 logger = logging.getLogger(__name__)
 
 _OEMBED_URL = "https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/{username}/"
-_PROFILE_URL = "https://www.instagram.com/{username}/"
+_NATIVE_CHECK_URL = "https://i.instagram.com/api/v1/users/check_username/"
 
 _REQUEST_TIMEOUT = 20.0
 _IMPERSONATE = "chrome124"
@@ -51,10 +51,14 @@ _OEMBED_HEADERS: dict[str, str] = {
     "Accept": "application/json",
 }
 
-_PROFILE_HEADERS: dict[str, str] = {
-    "User-Agent": _CHROME_USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
+_NATIVE_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Instagram 269.0.0.18.75 Android (30/11; 480dpi; 1080x2176; "
+        "Xiaomi; Mi A3; laurel_sprout; qcom; ru_RU; 314665256)"
+    ),
+    "Accept-Language": "en-US",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "X-IG-App-ID": "936619743392459",
 }
 
 _NETWORK_EXCEPTIONS = (
@@ -147,7 +151,7 @@ def _parse_json_body(response: Any) -> dict[str, Any] | None:
 
 
 class InstagramChecker:
-    """Instagram username mavjudligini oEmbed va profile redirect orqali tekshiradi."""
+    """Instagram username mavjudligini oEmbed va native mobile API orqali tekshiradi."""
 
     def __init__(self, proxy_url: str | None = None) -> None:
         self._base_proxy: str | None = proxy_url or (
@@ -155,14 +159,14 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=oembed+profile",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=oembed+native",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
         )
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (oEmbed + profile) | proxy=%s",
+            "InstagramChecker ishga tushdi (oEmbed + native) | proxy=%s",
             bool(self._base_proxy),
         )
 
@@ -251,7 +255,6 @@ class InstagramChecker:
         url: str,
         headers: dict[str, str],
         data: dict[str, str] | None = None,
-        allow_redirects: bool = True,
     ) -> Any:
         request = session.post if method.upper() == "POST" else session.get
         return await request(
@@ -259,7 +262,7 @@ class InstagramChecker:
             headers=headers,
             data=data,
             timeout=_REQUEST_TIMEOUT,
-            allow_redirects=allow_redirects,
+            allow_redirects=True,
             verify=False,
             impersonate=_IMPERSONATE,
         )
@@ -290,61 +293,47 @@ class InstagramChecker:
             return {"kind": "check_required", "error": "oEmbed profile not found"}
         return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_taken"}
 
-    async def _try_profile(
+    async def _try_native(
         self,
         session: AsyncSession,
         username: str,
     ) -> dict[str, Any]:
-        profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
         try:
             response = await self._request(
                 session,
-                "GET",
-                profile_url,
-                _PROFILE_HEADERS,
-                allow_redirects=False,
+                "POST",
+                _NATIVE_CHECK_URL,
+                _NATIVE_HEADERS,
+                data={"username": username},
             )
         except _NETWORK_EXCEPTIONS as exc:
             return {
                 "kind": "ok",
                 "status": CheckStatus.TAKEN,
                 "source": "safe_fallback",
-                "error": f"profile network error: {exc}",
+                "error": f"native network error: {exc}",
             }
 
         status_code = int(getattr(response, "status_code", 0) or 0)
-        location = str(
-            getattr(response, "headers", {}).get("Location", "")
-            or getattr(response, "headers", {}).get("location", "")
-            or ""
-        ).lower()
-        html = _body_text(response)
-        html_lower = html.lower()
+        if status_code == 429:
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_fallback"}
 
-        if status_code in (301, 302, 307, 308) and (
-            "accounts/login" in location or "challenge" in location
+        payload = _parse_json_body(response)
+        if not payload:
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_fallback"}
+
+        if payload.get("available") is True:
+            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "native_available"}
+
+        if (
+            payload.get("available") is False
+            or "error" in payload
+            or payload.get("status") == "fail"
         ):
             return {
                 "kind": "ok",
                 "status": CheckStatus.TAKEN,
-                "source": "profile_redirect_banned",
-            }
-
-        if "/accounts/login" in html_lower and "page not found" not in html_lower:
-            return {
-                "kind": "ok",
-                "status": CheckStatus.TAKEN,
-                "source": "profile_redirect_banned",
-            }
-
-        if status_code == 404:
-            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_404"}
-
-        if "page not found" in html_lower or "sorry, this page isn't available" in html_lower:
-            return {
-                "kind": "ok",
-                "status": CheckStatus.AVAILABLE,
-                "source": "profile_page_not_found",
+                "source": "native_taken_banned",
             }
 
         return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_fallback"}
@@ -358,7 +347,7 @@ class InstagramChecker:
             if oembed["kind"] != "check_required":
                 return oembed
 
-            return await self._try_profile(session, username)
+            return await self._try_native(session, username)
 
 
 instagram_checker = InstagramChecker()
