@@ -33,7 +33,7 @@ from models.username_log import CheckStatus
 logger = logging.getLogger(__name__)
 
 _OEMBED_URL = "https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/{username}/"
-_REGISTRATION_CHECK_URL = "https://i.instagram.com/api/v1/users/check_username/"
+_PROFILE_URL = "https://www.instagram.com/{username}/"
 
 _REQUEST_TIMEOUT = 6.0
 _IMPERSONATE = "chrome124"
@@ -47,11 +47,10 @@ _OEMBED_HEADERS: dict[str, str] = {
     "Accept": "application/json",
 }
 
-_REGISTRATION_HEADERS: dict[str, str] = {
-    "User-Agent": "Instagram 269.0.0.18.75 Android (30/11; 480dpi; 1080x2176; Xiaomi; Mi A3; laurel_sprout; qcom; ru_RU; 314665256)",
-    "Accept-Language": "en-US",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "X-IG-App-ID": "936619743392459",
+_PROFILE_HEADERS: dict[str, str] = {
+    "User-Agent": _CHROME_USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 _NETWORK_EXCEPTIONS = (
@@ -151,16 +150,15 @@ class InstagramChecker:
             settings.proxy_url if settings.proxy_enabled else None
         )
         self._checking_usernames: set[str] = set()
-        self._registration_semaphore = asyncio.Semaphore(1)
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=oembed+registration",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=oembed+profile",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
         )
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (oEmbed + registration) | proxy=%s",
+            "InstagramChecker ishga tushdi (oEmbed + profile) | proxy=%s",
             bool(self._base_proxy),
         )
 
@@ -268,7 +266,7 @@ class InstagramChecker:
         except _NETWORK_EXCEPTIONS as exc:
             return {
                 "kind": "check_required",
-                "error": f"oEmbed unavailable; proceeding to registration check: {exc}",
+                "error": f"oEmbed unavailable; proceeding to profile check: {exc}",
             }
 
         status_code = int(getattr(resp, "status_code", 0) or 0)
@@ -281,45 +279,45 @@ class InstagramChecker:
             return {"kind": "check_required", "error": "oEmbed profile not found"}
         return {"kind": "error", "error": f"oEmbed unexpected status: {status_code}"}
 
-    async def _try_registration_check(
+    async def _try_profile_check(
         self,
         session: AsyncSession,
         username: str,
     ) -> dict[str, Any]:
-        headers = _REGISTRATION_HEADERS
-        try:
-            async with self._registration_semaphore:
+        profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
                 response = await self._request(
                     session,
-                    "POST",
-                    _REGISTRATION_CHECK_URL,
-                    headers,
-                    data={"username": username},
+                    "GET",
+                    profile_url,
+                    _PROFILE_HEADERS,
                 )
-        except _NETWORK_EXCEPTIONS as exc:
-            return {
-                "kind": "error",
-                "error": f"registration check network error: {exc}",
-            }
+            except _NETWORK_EXCEPTIONS as exc:
+                last_error = exc
+                continue
 
-        raw_text = _body_text(response)
-        status_code = int(getattr(response, "status_code", 0) or 0)
-        if status_code == 429:
-            return {
-                "kind": "error",
-                "error": "registration check rate-limited (HTTP 429)",
-            }
-        payload = _parse_json_body(response)
-        if payload and payload.get("available") is True:
-            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "reg_available"}
-        if (
-            payload and payload.get("available") is False
-        ) or "username_is_taken" in raw_text:
-            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "reg_taken_or_banned"}
+            raw_text = _body_text(response)
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            response_url = str(getattr(response, "url", ""))
+
+            if "Page Not Found" in raw_text or "Sorry, this page isn't available" in raw_text:
+                return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "page_not_found"}
+            if status_code == 404:
+                return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "http_404"}
+            if "Followers" in raw_text or "og:description" in raw_text:
+                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_meta_taken"}
+            if "/accounts/login" in response_url or "checkpoint" in response_url:
+                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
+            if status_code == 200:
+                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "deactivated_or_shadow"}
+
+            return {"kind": "error", "error": f"profile check inconclusive: status={status_code}"}
 
         return {
             "kind": "error",
-            "error": f"registration check inconclusive: status={status_code}",
+            "error": f"profile check network timeout after retry: {last_error}",
         }
 
     async def _funnel_check(self, username: str, proxy: str | None) -> dict[str, Any]:
@@ -331,7 +329,7 @@ class InstagramChecker:
             if oembed["kind"] != "check_required":
                 return oembed
 
-            return await self._try_registration_check(session, username)
+            return await self._try_profile_check(session, username)
 
 
 instagram_checker = InstagramChecker()
