@@ -1,10 +1,13 @@
 """
 services/checker.py — Instagram username tekshirish servisi.
 
-Yagona yo'l: GET /api/v1/users/web_profile_info/?username=
-  AVAILABLE — HTTP 404 (username tizimda yo'q)
-  TAKEN     — HTTP 200 (data.user bor yoki None), HTTP 400/403
-  ERROR     — HTTP 429 yoki tarmoq/SSL (max 3 urinish, yangi proxy sessiya)
+Asosiy yo'l: GET /web/search/topsearch/?context=blended&query=
+  users[].user.username == query  -> TAKEN
+  ro'yxatda yo'q                 -> zaxira profil GET
+
+Zaxira: GET https://www.instagram.com/{username}/
+  200 + og:title / instapp:owner_user_id -> TAKEN
+  aks holda                              -> AVAILABLE
 
 Klient: curl_cffi AsyncSession (impersonate=chrome124, verify=False).
 """
@@ -43,16 +46,29 @@ logger = logging.getLogger(__name__)
 
 # ─── Konstantlar ──────────────────────────────────────────────────────────────
 
-_WEB_PROFILE_INFO_URL = (
-    "https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+_TOPSEARCH_URL = (
+    "https://www.instagram.com/web/search/topsearch/?context=blended&query={query}"
 )
-_PROFILE_REFERER = "https://www.instagram.com/{username}/"
-_IG_APP_ID = "936619743392459"
+_PROFILE_URL = "https://www.instagram.com/{username}/"
 _MAX_RETRIES = 3
 _REQUEST_TIMEOUT = 12.0
 _IMPERSONATE = "chrome124"
 _BACKOFF_BASE = 2.0
 _BACKOFF_CAP = 30.0
+
+_SEARCH_HEADERS: dict[str, str] = {
+    "Accept": "*/*",
+    "Referer": "https://www.instagram.com/",
+}
+
+_PROFILE_HEADERS: dict[str, str] = {
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Referer": "https://www.instagram.com/",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 _NETWORK_EXCEPTIONS = (
     RequestsError,
@@ -65,6 +81,11 @@ _NETWORK_EXCEPTIONS = (
 )
 
 _USERNAME_RE = re.compile(r"^[a-z0-9._]{1,30}$")
+_OG_TITLE_RE = re.compile(
+    r'''<meta[^>]+(?:property|name)=["']og:title["'][^>]+content=["']([^"']+)["']'''
+    r'''|<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:title["']''',
+    re.IGNORECASE,
+)
 
 
 # ─── Natija dataclass ──────────────────────────────────────────────────────────
@@ -201,61 +222,39 @@ def _is_wrong_origin(response: Any) -> bool:
     return any(google_marks)
 
 
-def _api_headers(username: str) -> dict[str, str]:
-    return {
-        "X-IG-App-ID": _IG_APP_ID,
-        "X-Requested-With": "XMLHttpRequest",
-        "Referer": _PROFILE_REFERER.format(username=username),
-        "Accept": "*/*",
-    }
+def _exact_username_in_search(payload: dict[str, Any], username: str) -> bool:
+    users = payload.get("users")
+    if not isinstance(users, list):
+        return False
+
+    target = username.lower()
+    for item in users:
+        if not isinstance(item, dict):
+            continue
+        user = item.get("user")
+        if not isinstance(user, dict):
+            continue
+        found = str(user.get("username") or "").strip().lower()
+        if found == target:
+            return True
+    return False
 
 
-def _classify_web_profile_info(
-    status_code: int,
-    payload: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """
-    web_profile_info JSON tasnif. HTML/regex yo'q.
-
-    404 -> AVAILABLE
-    200 -> TAKEN (user dict yoki user=None / bloklangan)
-    400/403 -> TAKEN
-    429 -> retry
-    """
-    if status_code == 429:
-        return {
-            "kind": "retry",
-            "rate_limited": True,
-            "error": "HTTP 429 Rate Limited (web_profile_info)",
-        }
-
-    if status_code == 404:
-        return {"kind": "ok", "status": CheckStatus.AVAILABLE}
-
-    if status_code in (400, 403):
-        return {"kind": "ok", "status": CheckStatus.TAKEN}
-
-    if status_code == 200:
-        if payload is None:
-            return {
-                "kind": "retry",
-                "rate_limited": False,
-                "error": "HTTP 200 lekin JSON emas (web_profile_info)",
-            }
-        # data.user bor (faol) yoki None (blok/deactive) — ikkalasi ham TAKEN
-        return {"kind": "ok", "status": CheckStatus.TAKEN}
-
-    return {
-        "kind": "retry",
-        "rate_limited": False,
-        "error": f"HTTP {status_code} (web_profile_info)",
-    }
+def _has_profile_metatags(html: str) -> bool:
+    if not html:
+        return False
+    lowered = html.lower()
+    if "instapp:owner_user_id" in lowered:
+        return True
+    if _OG_TITLE_RE.search(html):
+        return True
+    return False
 
 
 # ─── Asosiy tekshiruvchi sinf ──────────────────────────────────────────────────
 
 class InstagramChecker:
-    """Instagram username mavjudligini web_profile_info JSON orqali tekshiradi."""
+    """Instagram username mavjudligini topsearch JSON (+ profil zaxira) orqali tekshiradi."""
 
     def __init__(self, proxy_url: str | None = None) -> None:
         self._base_proxy: str | None = proxy_url or (
@@ -263,7 +262,7 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | client=curl_cffi/%s | api=web_profile_info",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | client=curl_cffi/%s | api=topsearch",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
             _IMPERSONATE,
@@ -271,7 +270,7 @@ class InstagramChecker:
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (web_profile_info, curl_cffi/%s) | proxy=%s",
+            "InstagramChecker ishga tushdi (topsearch, curl_cffi/%s) | proxy=%s",
             _IMPERSONATE,
             bool(self._base_proxy),
         )
@@ -289,6 +288,7 @@ class InstagramChecker:
             "max_clients": 1,
             "verify": False,
             "allow_redirects": True,
+            "headers": _SEARCH_HEADERS,
         }
         if proxy:
             kwargs["proxy"] = proxy
@@ -357,7 +357,7 @@ class InstagramChecker:
                 await asyncio.sleep(random.uniform(0.35, 0.9))
 
             try:
-                result = await self._api_check(username, session_proxy)
+                result = await self._topsearch_check(username, session_proxy)
             except _NETWORK_EXCEPTIONS as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 logger.warning(
@@ -383,7 +383,8 @@ class InstagramChecker:
 
             if result["kind"] == "ok":
                 status: CheckStatus = result["status"]
-                logger.info("[@%s] %s (web_profile_info)", username, status.value)
+                source = result.get("source", "topsearch")
+                logger.info("[@%s] %s (%s)", username, status.value, source)
                 return CheckResult(
                     username=username,
                     status=status,
@@ -425,56 +426,99 @@ class InstagramChecker:
             attempts=max_retries,
         )
 
-    async def _api_check(
+    async def _topsearch_check(
         self,
         username: str,
         proxy: str | None,
     ) -> dict[str, Any]:
-        """Bitta yangi proxy sessiya: faqat web_profile_info GET."""
+        """Bitta yangi proxy sessiya: topsearch, kerak bo'lsa profil GET zaxira."""
         kwargs = self._session_kwargs(proxy)
-        api_url = _WEB_PROFILE_INFO_URL.format(username=quote(username, safe="._"))
-        headers = _api_headers(username)
+        search_url = _TOPSEARCH_URL.format(query=quote(username, safe="._"))
+        profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
 
         async with AsyncSession(**kwargs) as session:
-            resp = await session.get(
-                api_url,
-                headers=headers,
+            search_resp = await session.get(
+                search_url,
+                headers=_SEARCH_HEADERS,
                 timeout=_REQUEST_TIMEOUT,
                 allow_redirects=True,
                 verify=False,
                 impersonate=_IMPERSONATE,
             )
 
-        if _is_wrong_origin(resp):
+            if _is_wrong_origin(search_resp):
+                return {
+                    "kind": "retry",
+                    "rate_limited": False,
+                    "error": "Proxy noto'g'ri origin (topsearch)",
+                }
+
+            search_status = int(getattr(search_resp, "status_code", 0) or 0)
+            if search_status == 429:
+                return {
+                    "kind": "retry",
+                    "rate_limited": True,
+                    "error": "HTTP 429 Rate Limited (topsearch)",
+                }
+
+            payload = _parse_json_body(search_resp)
+            if payload is None:
+                return {
+                    "kind": "retry",
+                    "rate_limited": False,
+                    "error": f"topsearch JSON emas (HTTP {search_status})",
+                }
+
+            if _exact_username_in_search(payload, username):
+                return {
+                    "kind": "ok",
+                    "status": CheckStatus.TAKEN,
+                    "source": "topsearch",
+                }
+
+            logger.debug(
+                "[@%s] topsearch da aniq match yo'q | users=%d | profil GET zaxira",
+                username,
+                len(payload.get("users") or []) if isinstance(payload.get("users"), list) else 0,
+            )
+
+            html_resp = await session.get(
+                profile_url,
+                headers=_PROFILE_HEADERS,
+                timeout=_REQUEST_TIMEOUT,
+                allow_redirects=True,
+                verify=False,
+                impersonate=_IMPERSONATE,
+            )
+
+        if _is_wrong_origin(html_resp):
             return {
                 "kind": "retry",
                 "rate_limited": False,
-                "error": "Proxy noto'g'ri origin (web_profile_info)",
+                "error": "Proxy noto'g'ri origin (profile GET)",
             }
 
-        status_code = int(getattr(resp, "status_code", 0) or 0)
-        payload = _parse_json_body(resp)
+        html_status = int(getattr(html_resp, "status_code", 0) or 0)
+        if html_status == 429:
+            return {
+                "kind": "retry",
+                "rate_limited": True,
+                "error": "HTTP 429 Rate Limited (profile GET)",
+            }
 
-        user = None
-        if payload:
-            data = payload.get("data")
-            if isinstance(data, dict):
-                user = data.get("user")
-            elif "user" in payload:
-                user = payload.get("user")
+        html = _body_text(html_resp)
+        if html_status == 200 and _has_profile_metatags(html):
+            return {
+                "kind": "ok",
+                "status": CheckStatus.TAKEN,
+                "source": "profile GET",
+            }
 
-        logger.debug(
-            "[@%s] web_profile_info GET -> HTTP %d json=%s user=%s",
-            username,
-            status_code,
-            bool(payload),
-            "yo'q" if user is None else "bor",
-        )
-
-        classified = _classify_web_profile_info(status_code, payload)
-        if classified["kind"] == "ok":
-            classified["source"] = "web_profile_info"
-        return classified
+        return {
+            "kind": "ok",
+            "status": CheckStatus.AVAILABLE,
+            "source": "topsearch+profile",
+        }
 
 
 instagram_checker = InstagramChecker()
