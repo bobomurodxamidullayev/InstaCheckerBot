@@ -151,6 +151,7 @@ class InstagramChecker:
             settings.proxy_url if settings.proxy_enabled else None
         )
         self._checking_usernames: set[str] = set()
+        self._registration_semaphore = asyncio.Semaphore(1)
         logger.info(
             "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=oembed+registration",
             "ha" if self._base_proxy else "yo'q",
@@ -198,15 +199,18 @@ class InstagramChecker:
             logger.warning("[@%s] Parallel tekshiruv — davom etiladi.", username_clean)
 
         self._checking_usernames.add(username_clean)
-        extra_tries = 1 if max_retries >= 1 else 0
+        max_attempts = 1 + (2 if max_retries >= 1 else 0)
         attempts = 0
         try:
             await asyncio.sleep(
                 random.uniform(settings.check_delay_min, settings.check_delay_max)
             )
-            for attempt in range(1, 2 + extra_tries):
+            for attempt in range(1, max_attempts + 1):
                 attempts = attempt
-                sticky_proxy = _make_session_proxy(self._base_proxy) if attempt == 1 else None
+                sticky_proxy = (
+                    _make_session_proxy(self._base_proxy)
+                    if attempt < max_attempts else None
+                )
                 result = await self._funnel_check(username_clean, sticky_proxy)
                 if result.get("kind") == "ok":
                     status: CheckStatus = result["status"]
@@ -219,6 +223,17 @@ class InstagramChecker:
                     )
                 if result.get("retries_exhausted"):
                     break
+                if result.get("retryable"):
+                    retry_after = min(float(result.get("retry_after", 1.0)), 30.0)
+                    logger.warning(
+                        "[@%s] rate limit; retrying in %.1fs | urinish %d/%d",
+                        username_clean,
+                        retry_after,
+                        attempt,
+                        max_attempts,
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
                 logger.warning(
                     "[@%s] tarmoq/proxy xato (%s) | urinish %d",
                     username_clean,
@@ -295,13 +310,14 @@ class InstagramChecker:
     ) -> dict[str, Any]:
         headers = _REGISTRATION_HEADERS
         try:
-            response = await self._request(
-                session,
-                "POST",
-                _REGISTRATION_CHECK_URL,
-                headers,
-                data={"username": username},
-            )
+            async with self._registration_semaphore:
+                response = await self._request(
+                    session,
+                    "POST",
+                    _REGISTRATION_CHECK_URL,
+                    headers,
+                    data={"username": username},
+                )
         except _NETWORK_EXCEPTIONS as exc:
             return {
                 "kind": "error",
@@ -309,6 +325,19 @@ class InstagramChecker:
             }
 
         raw_text = _body_text(response)
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        if status_code == 429:
+            retry_after_header = getattr(response, "headers", {}).get("Retry-After")
+            try:
+                retry_after = max(float(retry_after_header), settings.rate_limit_sleep)
+            except (TypeError, ValueError):
+                retry_after = settings.rate_limit_sleep
+            return {
+                "kind": "error",
+                "retryable": True,
+                "retry_after": retry_after,
+                "error": "registration check rate-limited (HTTP 429)",
+            }
         payload = _parse_json_body(response)
         if payload and payload.get("available") is True:
             return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "reg_available"}
@@ -319,7 +348,7 @@ class InstagramChecker:
 
         return {
             "kind": "error",
-            "error": f"registration check inconclusive: status={getattr(response, 'status_code', 0)}",
+            "error": f"registration check inconclusive: status={status_code}",
         }
 
     async def _funnel_check(self, username: str, proxy: str | None) -> dict[str, Any]:
