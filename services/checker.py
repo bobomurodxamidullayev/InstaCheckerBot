@@ -37,29 +37,37 @@ from models.username_log import CheckStatus
 
 logger = logging.getLogger(__name__)
 
-_ANDROID_CHECK_USERNAME_URL = "https://i.instagram.com/api/v1/users/check_username/"
+_SIGNUP_PAGE_URL = "https://www.instagram.com/accounts/emailsignup/"
+_SIGNUP_ATTEMPT_URL = "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
 _PROFILE_URL = "https://www.instagram.com/{username}/"
 
 _REQUEST_TIMEOUT = 20.0
 _IMPERSONATE = "chrome120"
-_ANDROID_UA = (
-    "Instagram 269.0.0.18.75 Android (30/11; 480dpi; 1080x2176; Xiaomi; "
-    "Mi A3; laurel_sprout; qcom; ru_RU; 314665256)"
+_SIGNUP_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-_JSON_HEADERS: dict[str, str] = {
-    "User-Agent": _ANDROID_UA,
-    "Accept": "application/json",
+_SIGNUP_PAGE_HEADERS: dict[str, str] = {
+    "User-Agent": _SIGNUP_USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+_SIGNUP_HEADERS: dict[str, str] = {
+    "User-Agent": _SIGNUP_USER_AGENT,
     "Accept-Language": "en-US",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Content-Type": "application/x-www-form-urlencoded",
     "X-IG-App-ID": "936619743392459",
-    "X-FB-HTTP-Engine": "Liger",
+    "X-ASBD-ID": "129477",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": _SIGNUP_PAGE_URL,
 }
 
 _PROFILE_HEADERS: dict[str, str] = {
-    "User-Agent": _ANDROID_UA,
+    "User-Agent": _SIGNUP_USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 _NETWORK_EXCEPTIONS = (
@@ -157,27 +165,23 @@ def _is_timeout_exception(exc: BaseException) -> bool:
     )
 
 
-def _classify_android_response(
-    status_code: int,
-    payload: dict[str, Any] | None,
-) -> dict[str, Any]:
-    """Classify native JSON signals without treating missing data as available."""
-    if status_code == 429:
-        return {"kind": "fallback", "error": "HTTP 429 Rate Limited"}
+def _has_username_error(payload: dict[str, Any]) -> bool:
+    errors = payload.get("errors")
+    if isinstance(errors, dict):
+        return "username" in errors
+    if isinstance(errors, list):
+        return any(
+            (isinstance(error, dict) and "username" in error)
+            or (isinstance(error, str) and "username" in error.lower())
+            for error in errors
+        )
+    if isinstance(errors, str):
+        return "username" in errors.lower()
+    return False
 
-    if not payload:
-        return {"kind": "safe_taken", "error": f"native HTTP {status_code} without JSON"}
 
-    if payload.get("available") is True:
-        return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "android_available"}
-
-    if payload.get("available") is False:
-        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "android_taken"}
-
-    if "error" in payload or payload.get("status") == "fail":
-        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "android_taken"}
-
-    return {"kind": "safe_taken", "error": "native response is ambiguous"}
+def _looks_like_regular_word(username: str) -> bool:
+    return username.isalpha() and len(username) >= 4
 
 
 class InstagramChecker:
@@ -189,14 +193,14 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=android",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=signup",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
         )
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (native Android) | proxy=%s",
+            "InstagramChecker ishga tushdi (CSRF signup) | proxy=%s",
             bool(self._base_proxy),
         )
 
@@ -210,7 +214,7 @@ class InstagramChecker:
             "max_clients": 1,
             "verify": False,
             "allow_redirects": True,
-            "headers": _JSON_HEADERS,
+            "headers": _SIGNUP_PAGE_HEADERS,
         }
         if proxy:
             kwargs["proxy"] = proxy
@@ -297,27 +301,52 @@ class InstagramChecker:
             impersonate=_IMPERSONATE,
         )
 
-    async def _try_android(
+    async def _check_signup_availability(
         self,
-        session: AsyncSession,
         username: str,
+        proxy: str | None,
     ) -> dict[str, Any]:
-        try:
-            resp = await self._request(
-                session,
-                "POST",
-                _ANDROID_CHECK_USERNAME_URL,
-                _JSON_HEADERS,
-                data={"username": username},
-            )
-        except _NETWORK_EXCEPTIONS as exc:
-            error_kind = "timeout" if _is_timeout_exception(exc) else "network"
-            return {"kind": "fallback", "error": f"native {error_kind}: {exc}"}
+        session_kwargs = self._session_kwargs(proxy)
+        session_kwargs["headers"] = _SIGNUP_PAGE_HEADERS
+        async with AsyncSession(**session_kwargs) as session:
+            try:
+                page = await self._request(
+                    session,
+                    "GET",
+                    _SIGNUP_PAGE_URL,
+                    _SIGNUP_PAGE_HEADERS,
+                )
+                csrf_token = session.cookies.get("csrftoken") or "missing"
+                headers = {**_SIGNUP_HEADERS, "X-CSRFToken": csrf_token}
+                email = f"chk_{secrets.token_hex(8)}@gmail.com"
+                resp = await self._request(
+                    session,
+                    "POST",
+                    _SIGNUP_ATTEMPT_URL,
+                    headers,
+                    data={
+                        "email": email,
+                        "username": username,
+                        "first_name": "",
+                        "opt_into_one_tap": "false",
+                    },
+                )
+            except _NETWORK_EXCEPTIONS as exc:
+                error_kind = "timeout" if _is_timeout_exception(exc) else "network"
+                return {"kind": "fallback", "error": f"signup {error_kind}: {exc}"}
 
-        return _classify_android_response(
-            int(getattr(resp, "status_code", 0) or 0),
-            _parse_json_body(resp),
-        )
+            status_code = int(getattr(resp, "status_code", 0) or 0)
+            if status_code == 429:
+                return {"kind": "fallback", "error": "signup HTTP 429"}
+
+            payload = _parse_json_body(resp)
+            if not payload:
+                return {"kind": "fallback", "error": "signup response is not JSON"}
+            if _has_username_error(payload):
+                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "signup_taken"}
+            if payload.get("status") == "ok":
+                return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "signup_available"}
+            return {"kind": "fallback", "error": "signup response is ambiguous"}
 
     async def _try_profile(
         self,
@@ -347,28 +376,34 @@ class InstagramChecker:
         ):
             return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_active"}
 
+        if "/accounts/login" in final_url or "/challenge" in final_url:
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_deactive"}
+
         if (
             status_code == 404
             or "<title>page not found" in html_lower
-            or "<title>instagram</title>" in html_lower
             or "sorry, this page isn't available." in html_lower
         ):
             return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_available"}
 
-        if "/accounts/login" in final_url or "/challenge" in final_url:
+        if "<title>instagram</title>" in html_lower:
+            if _looks_like_regular_word(username):
+                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_deactive"}
+            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_available"}
+
+        if _looks_like_regular_word(username):
             return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_deactive"}
 
         return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_available"}
 
     async def _funnel_check(self, username: str, proxy: str | None) -> dict[str, Any]:
+        signup = await self._check_signup_availability(username, proxy)
+        if signup["kind"] == "ok":
+            return signup
+
         kwargs = self._session_kwargs(proxy)
         async with AsyncSession(**kwargs) as session:
-            native = await self._try_android(session, username)
-            if native["kind"] == "ok":
-                return native
-            if native["kind"] == "fallback":
-                return await self._try_profile(session, username)
-            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_fallback"}
+            return await self._try_profile(session, username)
 
 
 instagram_checker = InstagramChecker()
