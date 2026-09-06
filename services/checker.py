@@ -2,10 +2,11 @@
 services/checker.py — Instagram username tekshirish servisi.
 
 Gibrid (funnel):
-  1) Tezkor filtr: topsearch aniq match yoki profil GET HTTP 200 -> TAKEN
-  2) Tasdiqlash: 404 / topilmagan nom -> POST web/accounts/check_username/
-       available=true  -> AVAILABLE
-       available=false / username_is_taken -> TAKEN (ban, deactive, 14 kun lock)
+  1) Tezkor filtr: topsearch aniq match YOKI profil HTML da qat'iy markerlar -> TAKEN
+     (HTTP 200 yetarli emas: login/404 sahifa ham 200 bo'lishi mumkin)
+  2) Tasdiqlash: marker yo'q / login / not found -> POST web/accounts/check_username/
+       available=true  -> AVAILABLE (faqat shunda)
+       available=false / username_is_taken -> TAKEN
        429 -> yangi rotating proxy IP, 1 marta qayta urinish
 
 Klient: curl_cffi AsyncSession (impersonate=chrome124, verify=False).
@@ -225,6 +226,75 @@ def _is_wrong_origin(response: Any) -> bool:
         "gws" == server,
     )
     return any(google_marks)
+
+
+_PROFILE_NOT_FOUND_MARKERS = (
+    "sorry, this page isn't available",
+    "the link you followed may be broken",
+    "page not found",
+    "this page isn't available",
+)
+
+def _og_meta_content(html: str, property_name: str) -> str:
+    patterns = (
+        rf'property=["\']{re.escape(property_name)}["\'][^>]*content=["\']([^"\']*)["\']',
+        rf'content=["\']([^"\']*)["\'][^>]*property=["\']{re.escape(property_name)}["\']',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, html, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _html_proves_existing_profile(html: str, username: str, final_url: str = "") -> bool:
+    """
+    Profil GET ni TAKEN deb belgilash uchun qat'iy HTML isboti.
+    HTTP 200 yetarli emas: login/redirect/404 ham 200 qaytarishi mumkin.
+    """
+    if not html or len(html.strip()) < 400:
+        return False
+
+    lower = html.lower()
+    url = (final_url or "").lower()
+    if "/accounts/login" in url or "/challenge" in url:
+        return False
+    if any(marker in lower for marker in _PROFILE_NOT_FOUND_MARKERS):
+        return False
+
+    target = username.strip().lstrip("@").lower()
+    if not target:
+        return False
+
+    og_desc = _og_meta_content(html, "og:description").lower()
+    if og_desc and any(word in og_desc for word in ("follower", "following", "posts")):
+        return True
+
+    user_re = re.escape(target)
+    if re.search(rf'"username"\s*:\s*"{user_re}"', html, re.IGNORECASE):
+        if re.search(r'"full_name"\s*:\s*"(?:\\.|[^"\\])+"', html):
+            return True
+        if re.search(r'"biography"\s*:\s*"(?:\\.|[^"\\])+"', html):
+            return True
+        if re.search(r'"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*\d+', html):
+            return True
+
+    looks_like_login = (
+        "log in to instagram" in lower
+        or "/accounts/login" in lower
+        or "login_form" in lower
+    )
+    if looks_like_login:
+        return False
+
+    if re.search(
+        rf'content=["\']https://(?:www\.)?instagram\.com/{user_re}/["\']',
+        html,
+        re.IGNORECASE,
+    ):
+        return True
+
+    return False
 
 
 def _exact_username_in_search(payload: dict[str, Any], username: str) -> bool:
@@ -597,8 +667,8 @@ class InstagramChecker:
         profile_url: str,
     ) -> dict[str, Any]:
         """
-        kind=ok -> TAKEN
-        kind=continue -> 404/boshqa, check_username ga o't
+        kind=ok -> TAKEN (faqat HTML da qat'iy profil markerlari bo'lsa)
+        kind=continue -> login/404/bo'sh/marker yo'q — check_username ga o't
         kind=skip -> timeout/429/SSL — check_username ga o't
         """
         try:
@@ -616,7 +686,9 @@ class InstagramChecker:
             logger.warning("[@%s] profil GET HTTP 429 — yangi IP + check_username", username)
             return {"kind": "skip", "rate_limited": True, "error": "HTTP 429 Rate Limited (profile GET)"}
 
-        if html_status == 200:
+        html = _body_text(html_resp)
+        final_url = str(getattr(html_resp, "url", "") or "")
+        if html_status == 200 and _html_proves_existing_profile(html, username, final_url):
             return {
                 "kind": "ok",
                 "status": CheckStatus.TAKEN,
@@ -625,7 +697,7 @@ class InstagramChecker:
             }
 
         logger.debug(
-            "[@%s] 1-bosqich o'tkazdi (HTTP %d) | check_username tasdiqlash",
+            "[@%s] profil GET HTTP %d, qat'iy marker yo'q | check_username tasdiqlash",
             username,
             html_status,
         )
@@ -672,8 +744,8 @@ class InstagramChecker:
         skip_topsearch: bool = False,
     ) -> dict[str, Any]:
         """
-        1) topsearch / profil GET — band bo'lsa darhol TAKEN.
-        2) 404 / topilmagan — check_username POST (AVAILABLE faqat available=true).
+        1) topsearch aniq match yoki profil HTML markerlari — TAKEN.
+        2) Marker yo'q / login / 404 — check_username POST (AVAILABLE faqat available=true).
         topsearch timeout/429/SSL da ERROR qaytmaydi — keyingi bosqichga o'tadi.
         """
         search_url = _TOPSEARCH_URL.format(query=quote(username, safe="._"))
