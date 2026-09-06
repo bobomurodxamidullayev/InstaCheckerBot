@@ -76,7 +76,9 @@ def create_telegram_session() -> AiohttpSession:
       - enable_cleanup_closed=True: yopilgan ulanishlar avtomatik tozalanadi
       - force_close=False: keepalive ishlashiga ruxsat beriladi (tezlik uchun)
     """
-    session = AiohttpSession(timeout=30.0)
+    session = AiohttpSession(
+        timeout=aiohttp.ClientTimeout(total=60, connect=30)
+    )
     session._connector_type = aiohttp.TCPConnector
     session._connector_init.update(
         {
@@ -204,6 +206,7 @@ async def main() -> None:
         bot,
         skip_updates=True,
         handle_signals=True,
+        polling_timeout=30,
     )
 
 

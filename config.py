@@ -47,7 +47,7 @@ class Settings(BaseSettings):
     # ─── Checker ───────────────────────────────────────────────
     check_delay_min: float = Field(default=1.5, ge=0.5)
     check_delay_max: float = Field(default=3.5, ge=1.0)
-    concurrent_limit_proxy: int = Field(default=2, ge=1, le=50)
+    concurrent_limit_proxy: int = Field(default=6, ge=1, le=50)
     concurrent_limit_direct: int = Field(default=1, ge=1, le=10)
     rate_limit_sleep: float = Field(default=30.0, ge=5.0)
 

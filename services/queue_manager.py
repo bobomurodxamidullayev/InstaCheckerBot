@@ -34,8 +34,8 @@ logger = logging.getLogger(__name__)
 
 # ─── Telegram progress throttle sozlamalari ────────────────────────────────────
 # Telegram edit_message_text uchun max 1 req/2s (flood limit 30 req/min)
-_PROGRESS_THROTTLE_INTERVAL = 3.0   # soniya: minimum yangilanishlar orasidagi vaqt
-_PROGRESS_DEBOUNCE_BATCH = 5        # har N ta natijadan keyin majburiy yangilash
+_PROGRESS_THROTTLE_INTERVAL = 2.5   # soniya: edit_text uchun minimum interval
+_PROGRESS_DEBOUNCE_BATCH = 8        # har N ta natijadan keyin (vaqt yetgan bo'lsa) yangilash
 
 # ─── DB yozuv timeout ─────────────────────────────────────────────────────────
 _DB_SAVE_TIMEOUT = 15.0  # soniya
@@ -89,15 +89,13 @@ class _ProgressThrottle:
         if current == total:
             return True
 
-        # Har N natijadan keyin majburiy
-        if (current - self._last_sent_count) >= _PROGRESS_DEBOUNCE_BATCH:
-            return True
+        # Telegram flood: 2.5s dan tez-tez edit_text yuborilmasin
+        if elapsed < _PROGRESS_THROTTLE_INTERVAL:
+            return False
 
-        # Vaqt bo'yicha throttle
-        if elapsed >= _PROGRESS_THROTTLE_INTERVAL:
-            return True
-
-        return False
+        # Vaqt yetgan: har N ta tekshiruv yoki interval o'tganda
+        delta = current - self._last_sent_count
+        return delta >= _PROGRESS_DEBOUNCE_BATCH or elapsed >= _PROGRESS_THROTTLE_INTERVAL
 
     def mark_sent(self, current: int) -> None:
         self._last_sent_at = time.monotonic()
@@ -196,6 +194,9 @@ async def run_bulk_check(
                     completed=current,
                     total=total,
                 )
+
+        # Event loop'ga nafas: polling getUpdates timeout bo'lmasin
+        await asyncio.sleep(0.05)
 
     # Barcha tasklarni bir vaqtda ishga tushirish (index bilan jitter hisoblash uchun)
     tasks = [asyncio.create_task(check_one(i, u)) for i, u in enumerate(usernames)]
