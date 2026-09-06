@@ -3,11 +3,12 @@ services/checker.py — Instagram username tekshirish servisi.
 
 3-bosqichli funnel (bitta sticky proxy sessiyasi):
   1) Topsearch exact match -> TAKEN
-  2) Web registration attempt -> TAKEN / AVAILABLE (haqiqiy hakam)
-  3) HTML fallback faqat Tier 2 429 / SSL / tarmoq xatosida
+  2) web_profile_info JSON API -> AVAILABLE / TAKEN
+  3) Signup attempt faqat Tier 2 429 / SSL / timeout da
+     (HTML hech qachon o'qilmaydi)
 
 Hech qachon foydalanuvchiga uncaught ERROR (429, SSL, timeout) qaytmaydi:
-tarmoq xatosi fallback ga, fallback ham yiqilsa xavfsiz TAKEN.
+oxirgi chora — xavfsiz TAKEN.
 """
 from __future__ import annotations
 
@@ -49,7 +50,9 @@ _SIGNUP_PAGE_URL = "https://www.instagram.com/accounts/emailsignup/"
 _SIGNUP_ATTEMPT_URL = (
     "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
 )
-_PROFILE_URL = "https://www.instagram.com/{username}/"
+_WEB_PROFILE_URL = (
+    "https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+)
 
 _REQUEST_TIMEOUT = 20.0
 _IMPERSONATE = "chrome124"
@@ -69,6 +72,13 @@ _HTML_HEADERS: dict[str, str] = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Referer": "https://www.instagram.com/",
     "Upgrade-Insecure-Requests": "1",
+}
+
+_WEB_PROFILE_HEADERS: dict[str, str] = {
+    "User-Agent": _CHROME_UA,
+    "X-IG-App-ID": "936619743392459",
+    "X-Requested-With": "XMLHttpRequest",
+    "Accept": "*/*",
 }
 
 _SIGNUP_POST_HEADERS: dict[str, str] = {
@@ -93,13 +103,6 @@ _NETWORK_EXCEPTIONS = (
 )
 
 _USERNAME_RE = re.compile(r"^[a-z0-9._]{1,30}$")
-
-_PAGE_NOT_FOUND_MARKERS = (
-    "page not found",
-    "sorry, this page isn't available",
-    "the link you followed may be broken",
-    "<title>page not found",
-)
 
 _USERNAME_TAKEN_CODES = (
     "username_is_taken",
@@ -254,112 +257,95 @@ def _csrf_from_html(html: str) -> str:
     return match.group(1) if match else ""
 
 
-def _og_meta_content(html: str, property_name: str) -> str:
-    patterns = (
-        rf'property=["\']{re.escape(property_name)}["\'][^>]*content=["\']([^"\']*)["\']',
-        rf'content=["\']([^"\']*)["\'][^>]*property=["\']{re.escape(property_name)}["\']',
-    )
-    for pattern in patterns:
-        match = re.search(pattern, html, re.IGNORECASE)
-        if match:
-            return match.group(1)
-    return ""
+def _is_login_redirect(final_url: str, location: str = "") -> bool:
+    target = f"{final_url} {location}".lower()
+    return "/accounts/login" in target or "/challenge" in target
 
 
-def _html_has_page_not_found(html: str, status_code: int) -> bool:
-    if status_code == 404:
-        return True
-    lower = html.lower()
-    return any(marker in lower for marker in _PAGE_NOT_FOUND_MARKERS)
-
-
-def _html_has_profile_metadata(html: str) -> bool:
-    """Faol profil metama'lumoti — bo'sh SPA 404 shell dan farqlash uchun."""
-    if not html:
+def _payload_restricted(payload: dict[str, Any] | None) -> bool:
+    if not payload:
         return False
-    if "edge_followed_by" in html:
-        return True
-    if '"graphql":{"user":' in html or '"graphql": {"user":' in html:
-        return True
-    og_desc = _og_meta_content(html, "og:description").lower()
-    if og_desc and any(word in og_desc for word in ("follower", "following", "posts")):
-        return True
-    if re.search(r"\bFollowers\b", html) and re.search(r"\bFollowing\b", html):
-        return True
-    return False
-
-
-def _html_has_active_profile_marker(html: str) -> bool:
-    if "edge_followed_by" in html:
-        return True
-    if '"graphql":{"user":' in html or '"graphql": {"user":' in html:
-        return True
-    og_desc = _og_meta_content(html, "og:description").lower()
-    if og_desc and any(word in og_desc for word in ("follower", "following", "posts")):
-        return True
-    return False
-
-
-def _is_login_or_challenge(html: str, final_url: str, location: str = "") -> bool:
-    url = f"{final_url} {location}".lower()
-    if "/accounts/login" in url or "/challenge" in url:
-        return True
-    lower = html.lower()
-    return any((
-        "login_form" in lower,
-        "log in to instagram" in lower,
-        "checkpoint_required" in lower,
-        "challenge_required" in lower,
+    try:
+        blob = json.dumps(payload, ensure_ascii=False).lower()
+    except Exception:
+        blob = str(payload).lower()
+    return any(token in blob for token in (
+        "checkpoint_required",
+        "challenge_required",
+        "login_required",
     ))
 
 
-def _classify_profile_fallback(
+def _classify_web_profile_info(
     status_code: int,
-    html: str,
+    payload: dict[str, Any] | None,
     final_url: str,
     location: str = "",
 ) -> dict[str, Any]:
     """
-    Tier 3 tartibi:
-      1) Haqiqiy AVAILABLE markerlari (404 / Page Not Found) + profil meta yo'q
-      2) Faol profil markerlari
-      3) Login/challenge yoki 200 + Page Not Found yo'q -> TAKEN (deactive/ban)
+    kind=ok     -> TAKEN / AVAILABLE
+    kind=signup -> 429 / SSL yo'q, lekin javob ishonchsiz — signup ga o't
     """
-    has_not_found = _html_has_page_not_found(html, status_code)
-    has_profile_meta = _html_has_profile_metadata(html)
+    if status_code == 429:
+        return {"kind": "signup", "error": "HTTP 429 Rate Limited (web_profile_info)"}
 
-    if has_not_found and not has_profile_meta:
+    if _is_login_redirect(final_url, location):
+        return {
+            "kind": "ok",
+            "status": CheckStatus.TAKEN,
+            "source": "web_profile_restricted",
+        }
+
+    if status_code in (301, 302, 303, 307, 308):
+        return {
+            "kind": "signup",
+            "error": f"web_profile_info redirect HTTP {status_code}",
+        }
+
+    if _payload_restricted(payload):
+        return {
+            "kind": "ok",
+            "status": CheckStatus.TAKEN,
+            "source": "web_profile_restricted",
+        }
+
+    if status_code == 404:
         return {
             "kind": "ok",
             "status": CheckStatus.AVAILABLE,
-            "source": "fallback_404",
+            "source": "web_profile_404",
         }
 
-    if _html_has_active_profile_marker(html):
+    if status_code == 400:
         return {
             "kind": "ok",
             "status": CheckStatus.TAKEN,
-            "source": "fallback_active_marker",
+            "source": "web_profile_restricted",
         }
 
-    if _is_login_or_challenge(html, final_url, location):
+    if status_code == 200:
+        if payload is None:
+            return {
+                "kind": "signup",
+                "error": "web_profile_info JSON emas (HTTP 200)",
+            }
+        data = payload.get("data")
+        user = data.get("user") if isinstance(data, dict) else None
+        if isinstance(user, dict) and user:
+            return {
+                "kind": "ok",
+                "status": CheckStatus.TAKEN,
+                "source": "web_profile_active",
+            }
         return {
             "kind": "ok",
-            "status": CheckStatus.TAKEN,
-            "source": "fallback_deactive_200",
-        }
-
-    if status_code == 200 and not has_not_found:
-        return {
-            "kind": "ok",
-            "status": CheckStatus.TAKEN,
-            "source": "fallback_deactive_200",
+            "status": CheckStatus.AVAILABLE,
+            "source": "web_profile_empty",
         }
 
     return {
-        "kind": "ok",
-        "status": CheckStatus.TAKEN,
-        "source": "fallback_deactive_200",
+        "kind": "signup",
+        "error": f"web_profile_info noma'lum HTTP {status_code}",
     }
 
 
@@ -394,7 +380,7 @@ def _classify_signup_attempt(
 ) -> dict[str, Any]:
     """
     kind=ok        -> TAKEN / AVAILABLE
-    kind=fallback  -> 429 / SSL yo'q, lekin javob ishonchsiz — HTML ga o't
+    kind=fallback  -> 429 / SSL / ishonchsiz javob
     """
     if status_code == 429:
         return {"kind": "fallback", "error": "HTTP 429 Rate Limited (signup)"}
@@ -449,14 +435,14 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=topsearch+signup+html",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=topsearch+web_profile+signup",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
         )
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (topsearch + web signup) | proxy=%s",
+            "InstagramChecker ishga tushdi (topsearch + web_profile_info) | proxy=%s",
             bool(self._base_proxy),
         )
 
@@ -527,11 +513,12 @@ class InstagramChecker:
         url: str,
         headers: dict[str, str],
         data: dict[str, str] | str | None = None,
+        allow_redirects: bool = True,
     ) -> Any:
         kwargs: dict[str, Any] = {
             "headers": headers,
             "timeout": _REQUEST_TIMEOUT,
-            "allow_redirects": True,
+            "allow_redirects": allow_redirects,
             "verify": False,
             "impersonate": _IMPERSONATE,
         }
@@ -632,31 +619,51 @@ class InstagramChecker:
         session: AsyncSession,
         username: str,
     ) -> dict[str, Any]:
-        profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
+        """GET web_profile_info JSON. HTML o'qilmaydi."""
+        profile_url = _WEB_PROFILE_URL.format(
+            username=quote(username, safe="._"),
+        )
+        headers = {
+            **_WEB_PROFILE_HEADERS,
+            "Referer": f"https://www.instagram.com/{username}/",
+        }
         try:
-            resp = await self._request(session, "GET", profile_url, _HTML_HEADERS)
+            resp = await self._request(
+                session,
+                "GET",
+                profile_url,
+                headers,
+                allow_redirects=False,
+            )
         except _NETWORK_EXCEPTIONS as exc:
-            logger.warning("[@%s] profil GET zaxira tarmoq/SSL: %s", username, exc)
-            return {"kind": "skip", "error": f"{type(exc).__name__}: {exc}"}
+            logger.warning("[@%s] web_profile_info tarmoq/SSL: %s", username, exc)
+            return {"kind": "signup", "error": f"{type(exc).__name__}: {exc}"}
 
         if _is_wrong_origin(resp):
-            return {"kind": "skip", "error": "Proxy noto'g'ri origin (profile fallback)"}
+            return {"kind": "signup", "error": "Proxy noto'g'ri origin (web_profile_info)"}
 
         status_code = int(getattr(resp, "status_code", 0) or 0)
-        if status_code == 429:
-            return {"kind": "skip", "error": "HTTP 429 Rate Limited (profile fallback)"}
-
-        html = _body_text(resp)
+        payload = _parse_json_body(resp)
         final_url = str(getattr(resp, "url", "") or "")
         location = _header_get(getattr(resp, "headers", None), "location")
-        classified = _classify_profile_fallback(status_code, html, final_url, location)
-        logger.info(
-            "[@%s] profil zaxira HTTP %d -> %s (%s)",
-            username,
-            status_code,
-            classified["status"].value,
-            classified["source"],
+        classified = _classify_web_profile_info(
+            status_code, payload, final_url, location,
         )
+        if classified.get("kind") == "ok":
+            logger.info(
+                "[@%s] web_profile_info HTTP %d -> %s (%s)",
+                username,
+                status_code,
+                classified["status"].value,
+                classified["source"],
+            )
+        else:
+            logger.info(
+                "[@%s] web_profile_info HTTP %d -> signup (%s)",
+                username,
+                status_code,
+                classified.get("error"),
+            )
         return classified
 
     async def _funnel_check(self, username: str, proxy: str | None) -> dict[str, Any]:
@@ -664,30 +671,29 @@ class InstagramChecker:
         kwargs = self._session_kwargs(proxy)
 
         async with AsyncSession(**kwargs) as session:
-            csrf_token = await self._warm_csrf(session, username)
-
             topsearch = await self._try_topsearch(session, username, search_url)
             if topsearch["kind"] == "ok":
                 return topsearch
 
+            profile = await self._try_profile_fallback(session, username)
+            if profile.get("kind") == "ok":
+                return profile
+
+            logger.info(
+                "[@%s] web_profile_info fallback (%s) -> signup",
+                username,
+                profile.get("error", "noma'lum"),
+            )
+
+            csrf_token = await self._warm_csrf(session, username)
             signup = await self._try_signup_attempt(session, username, csrf_token)
             if signup["kind"] == "ok":
                 return signup
 
-            logger.info(
-                "[@%s] signup fallback (%s) -> HTML",
-                username,
-                signup.get("error", "noma'lum"),
-            )
-
-            fallback = await self._try_profile_fallback(session, username)
-            if fallback.get("kind") == "ok":
-                return fallback
-
             logger.warning(
-                "[@%s] profil zaxira ham xato (%s) -> TAKEN",
+                "[@%s] signup ham xato (%s) -> TAKEN",
                 username,
-                fallback.get("error"),
+                signup.get("error"),
             )
             return {
                 "kind": "ok",
