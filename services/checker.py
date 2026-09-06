@@ -1,18 +1,13 @@
 """
 services/checker.py — Instagram username tekshirish servisi.
 
-Funnel:
-  1) Tezkor filtr: topsearch aniq match -> TAKEN
-  2) Asosiy hakam: Instagram Android App API
-       POST https://i.instagram.com/api/v1/users/check_username/
-       available: true  -> AVAILABLE
-       available: false -> TAKEN (faol, deactive, ban, 14 kun lock)
-  3) Zaxira (faqat tarmoq xatosi bo'lsa): profil GET HTML marker
-       marker bor -> TAKEN
-       404 / marker yo'q -> AVAILABLE
+3-bosqichli funnel (bitta sticky proxy sessiyasi):
+  1) Topsearch exact match -> TAKEN
+  2) Web registration attempt -> TAKEN / AVAILABLE (haqiqiy hakam)
+  3) HTML fallback faqat Tier 2 429 / SSL / tarmoq xatosida
 
-Klient: curl_cffi AsyncSession (impersonate=chrome124, verify=False).
-Timeout 20s. DataImpulse: har urinishda yangi _session-{id} (yangi IP).
+Hech qachon foydalanuvchiga uncaught ERROR (429, SSL, timeout) qaytmaydi:
+tarmoq xatosi fallback ga, fallback ham yiqilsa xavfsiz TAKEN.
 """
 from __future__ import annotations
 
@@ -47,50 +42,45 @@ from models.username_log import CheckStatus
 
 logger = logging.getLogger(__name__)
 
-# ─── Konstantlar ──────────────────────────────────────────────────────────────
-
 _TOPSEARCH_URL = (
     "https://www.instagram.com/web/search/topsearch/?context=blended&query={query}"
 )
+_SIGNUP_PAGE_URL = "https://www.instagram.com/accounts/emailsignup/"
+_SIGNUP_ATTEMPT_URL = (
+    "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
+)
 _PROFILE_URL = "https://www.instagram.com/{username}/"
 
-# Instagram Android App rasmiy username tekshiruv endpointi
-_APP_CHECK_URL = "https://i.instagram.com/api/v1/users/check_username/"
-
-# Android App User-Agent — bu endpoint faqat app so'rovlariga javob beradi
-_APP_USER_AGENT = (
-    "Instagram 269.0.0.18.75 Android (30/11; 480dpi; 1080x2176; "
-    "Xiaomi; laurel_sprout; qcom; ru_RU; 314665256)"
-)
-
-_MAX_RETRIES = 3
 _REQUEST_TIMEOUT = 20.0
 _IMPERSONATE = "chrome124"
-_BACKOFF_BASE = 2.0
-_BACKOFF_CAP = 30.0
+_CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 _JSON_HEADERS: dict[str, str] = {
+    "User-Agent": _CHROME_UA,
     "Accept": "application/json",
     "Referer": "https://www.instagram.com/",
 }
 
 _HTML_HEADERS: dict[str, str] = {
-    "Accept": "text/html,application/xhtml+xml",
+    "User-Agent": _CHROME_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Referer": "https://www.instagram.com/",
     "Upgrade-Insecure-Requests": "1",
 }
 
-_APP_CHECK_HEADERS: dict[str, str] = {
-    "User-Agent": _APP_USER_AGENT,
-    "Accept-Language": "en-US",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+_SIGNUP_POST_HEADERS: dict[str, str] = {
+    "User-Agent": _CHROME_UA,
+    "X-IG-App-ID": "936619743392459",
+    "X-ASBD-ID": "129477",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://www.instagram.com/accounts/emailsignup/",
+    "Content-Type": "application/x-www-form-urlencoded",
     "Accept": "*/*",
-    "X-IG-Capabilities": "3brTvw==",
-    "X-IG-Connection-Type": "WIFI",
+    "Origin": "https://www.instagram.com",
 }
-
-_SEARCH_HEADERS = _JSON_HEADERS
-_PROFILE_HEADERS = _HTML_HEADERS
 
 _NETWORK_EXCEPTIONS = (
     RequestsError,
@@ -104,15 +94,21 @@ _NETWORK_EXCEPTIONS = (
 
 _USERNAME_RE = re.compile(r"^[a-z0-9._]{1,30}$")
 
-_PROFILE_NOT_FOUND_MARKERS = (
+_PAGE_NOT_FOUND_MARKERS = (
+    "page not found",
     "sorry, this page isn't available",
     "the link you followed may be broken",
-    "page not found",
-    "this page isn't available",
+    "<title>page not found",
 )
 
+_USERNAME_TAKEN_CODES = (
+    "username_is_taken",
+    "username_held_by_someone",
+    "username_unavailable",
+    "username_held_for_someone",
+    "username_taken",
+)
 
-# ─── Natija dataclass ──────────────────────────────────────────────────────────
 
 @dataclass
 class CheckResult:
@@ -136,11 +132,9 @@ class CheckResult:
         }
 
 
-# ─── Yordamchi funksiyalar ─────────────────────────────────────────────────────
-
 def _make_session_proxy(base_proxy: str | None) -> str | None:
     """
-    DataImpulse rotating proxy: har urinishda yangi sessiya ID.
+    DataImpulse rotating proxy: bitta check uchun bitta sticky session ID.
     Kirish:  http://{login}__cr.us:pass@gw.dataimpulse.com:823
     Chiqish: http://{login}__cr.us_session-{id}:pass@gw.dataimpulse.com:823
     """
@@ -163,13 +157,6 @@ def _make_session_proxy(base_proxy: str | None) -> str | None:
         f"{auth}@{host}",
         parsed.path, parsed.params, parsed.query, parsed.fragment,
     ))
-
-
-def _backoff_delay(attempt: int) -> float:
-    """HTTP 429 uchun exponential backoff (+ kichik jitter)."""
-    delay = min(_BACKOFF_BASE * (2 ** (attempt - 1)), _BACKOFF_CAP)
-    delay = min(delay, float(settings.rate_limit_sleep))
-    return delay + random.uniform(0.15, 0.75)
 
 
 def _header_get(headers: Any, name: str) -> str:
@@ -217,7 +204,7 @@ def _parse_json_body(response: Any) -> dict[str, Any] | None:
 
 
 def _is_wrong_origin(response: Any) -> bool:
-    """Proxy Instagram o'rniga Google yoki boshqa host qaytarsa — retry."""
+    """Proxy Instagram o'rniga Google yoki boshqa host qaytarsa — bu bosqichni o'tkaz."""
     final_url = str(getattr(response, "url", "") or "").lower()
     location = _header_get(getattr(response, "headers", None), "location").lower()
     snippet = _body_text(response)[:800].lower()
@@ -232,50 +219,148 @@ def _is_wrong_origin(response: Any) -> bool:
     ))
 
 
+def _csrf_from_session(session: Any) -> str:
+    cookies = getattr(session, "cookies", None)
+    if not cookies:
+        return ""
+    try:
+        value = cookies.get("csrftoken")
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    try:
+        for cookie in cookies:
+            name = getattr(cookie, "name", None)
+            if name is None and isinstance(cookie, (tuple, list)) and cookie:
+                name = cookie[0]
+            if str(name).lower() != "csrftoken":
+                continue
+            value = getattr(cookie, "value", None)
+            if value is None and isinstance(cookie, (tuple, list)) and len(cookie) > 1:
+                value = cookie[1]
+            if value:
+                return str(value)
+    except Exception:
+        pass
+    return ""
+
+
+def _csrf_from_html(html: str) -> str:
+    match = re.search(r'"csrf_token"\s*:\s*"([^"]+)"', html)
+    if match:
+        return match.group(1)
+    match = re.search(r"csrftoken=([A-Za-z0-9_-]+)", html, re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
 def _og_meta_content(html: str, property_name: str) -> str:
     patterns = (
         rf'property=["\']{re.escape(property_name)}["\'][^>]*content=["\']([^"\']*)["\']',
         rf'content=["\']([^"\']*)["\'][^>]*property=["\']{re.escape(property_name)}["\']',
     )
     for pattern in patterns:
-        m = re.search(pattern, html, re.IGNORECASE)
-        if m:
-            return m.group(1)
+        match = re.search(pattern, html, re.IGNORECASE)
+        if match:
+            return match.group(1)
     return ""
 
 
-def _html_proves_existing_profile(html: str, username: str, final_url: str = "") -> bool:
-    """HTML ichida haqiqiy profil markerlari borligini tekshiradi."""
-    if not html or len(html.strip()) < 400:
-        return False
-    lower = html.lower()
-    url = (final_url or "").lower()
-    if "/accounts/login" in url or "/challenge" in url:
-        return False
-    if any(m in lower for m in _PROFILE_NOT_FOUND_MARKERS):
-        return False
-    target = username.strip().lstrip("@").lower()
-    if not target:
-        return False
-    og_desc = _og_meta_content(html, "og:description").lower()
-    if og_desc and any(w in og_desc for w in ("follower", "following", "posts")):
+def _html_has_page_not_found(html: str, status_code: int) -> bool:
+    if status_code == 404:
         return True
-    user_re = re.escape(target)
-    if re.search(rf'"username"\s*:\s*"{user_re}"', html, re.IGNORECASE):
-        if re.search(r'"full_name"\s*:\s*"(?:\\.|[^"\\])+"', html):
-            return True
-        if re.search(r'"biography"\s*:\s*"(?:\\.|[^"\\])+"', html):
-            return True
-        if re.search(r'"edge_followed_by"\s*:\s*\{\s*"count"\s*:\s*\d+', html):
-            return True
-    if "log in to instagram" in lower or "login_form" in lower:
+    lower = html.lower()
+    return any(marker in lower for marker in _PAGE_NOT_FOUND_MARKERS)
+
+
+def _html_has_profile_metadata(html: str) -> bool:
+    """Faol profil metama'lumoti — bo'sh SPA 404 shell dan farqlash uchun."""
+    if not html:
         return False
-    if re.search(
-        rf'content=["\'"]https://(?:www\.)?instagram\.com/{user_re}/["\']',
-        html, re.IGNORECASE,
-    ):
+    if "edge_followed_by" in html:
+        return True
+    if '"graphql":{"user":' in html or '"graphql": {"user":' in html:
+        return True
+    og_desc = _og_meta_content(html, "og:description").lower()
+    if og_desc and any(word in og_desc for word in ("follower", "following", "posts")):
+        return True
+    if re.search(r"\bFollowers\b", html) and re.search(r"\bFollowing\b", html):
         return True
     return False
+
+
+def _html_has_active_profile_marker(html: str) -> bool:
+    if "edge_followed_by" in html:
+        return True
+    if '"graphql":{"user":' in html or '"graphql": {"user":' in html:
+        return True
+    og_desc = _og_meta_content(html, "og:description").lower()
+    if og_desc and any(word in og_desc for word in ("follower", "following", "posts")):
+        return True
+    return False
+
+
+def _is_login_or_challenge(html: str, final_url: str, location: str = "") -> bool:
+    url = f"{final_url} {location}".lower()
+    if "/accounts/login" in url or "/challenge" in url:
+        return True
+    lower = html.lower()
+    return any((
+        "login_form" in lower,
+        "log in to instagram" in lower,
+        "checkpoint_required" in lower,
+        "challenge_required" in lower,
+    ))
+
+
+def _classify_profile_fallback(
+    status_code: int,
+    html: str,
+    final_url: str,
+    location: str = "",
+) -> dict[str, Any]:
+    """
+    Tier 3 tartibi:
+      1) Haqiqiy AVAILABLE markerlari (404 / Page Not Found) + profil meta yo'q
+      2) Faol profil markerlari
+      3) Login/challenge yoki 200 + Page Not Found yo'q -> TAKEN (deactive/ban)
+    """
+    has_not_found = _html_has_page_not_found(html, status_code)
+    has_profile_meta = _html_has_profile_metadata(html)
+
+    if has_not_found and not has_profile_meta:
+        return {
+            "kind": "ok",
+            "status": CheckStatus.AVAILABLE,
+            "source": "fallback_404",
+        }
+
+    if _html_has_active_profile_marker(html):
+        return {
+            "kind": "ok",
+            "status": CheckStatus.TAKEN,
+            "source": "fallback_active_marker",
+        }
+
+    if _is_login_or_challenge(html, final_url, location):
+        return {
+            "kind": "ok",
+            "status": CheckStatus.TAKEN,
+            "source": "fallback_deactive_200",
+        }
+
+    if status_code == 200 and not has_not_found:
+        return {
+            "kind": "ok",
+            "status": CheckStatus.TAKEN,
+            "source": "fallback_deactive_200",
+        }
+
+    return {
+        "kind": "ok",
+        "status": CheckStatus.TAKEN,
+        "source": "fallback_deactive_200",
+    }
 
 
 def _exact_username_in_search(payload: dict[str, Any], username: str) -> bool:
@@ -294,61 +379,69 @@ def _exact_username_in_search(payload: dict[str, Any], username: str) -> bool:
     return False
 
 
-def _classify_app_check(
+def _username_error_blob(errors: Any) -> str:
+    if errors is None:
+        return ""
+    try:
+        return json.dumps(errors, ensure_ascii=False).lower()
+    except Exception:
+        return str(errors).lower()
+
+
+def _classify_signup_attempt(
     status_code: int,
     payload: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """
-    Android App check_username endpointi javobini tahlil qiladi.
-
-    available: true  -> AVAILABLE (nom haqiqatan bo'sh)
-    available: false -> TAKEN (faol, deactive, ban, spam-lock — barchasi false beradi)
-    status: fail     -> TAKEN
-    429              -> retry
-    JSON emas        -> retry
+    kind=ok        -> TAKEN / AVAILABLE
+    kind=fallback  -> 429 / SSL yo'q, lekin javob ishonchsiz — HTML ga o't
     """
     if status_code == 429:
-        return {"kind": "retry", "rate_limited": True,
-                "error": "HTTP 429 Rate Limited (app check)"}
+        return {"kind": "fallback", "error": "HTTP 429 Rate Limited (signup)"}
 
     if payload is None:
-        return {"kind": "retry", "rate_limited": False,
-                "error": f"App check JSON emas (HTTP {status_code})"}
+        return {
+            "kind": "fallback",
+            "error": f"Signup JSON emas (HTTP {status_code})",
+        }
 
-    # available: true -> AVAILABLE
-    available = payload.get("available")
-    if available is True:
-        return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "app_check"}
+    errors = payload.get("errors")
+    has_username_error = isinstance(errors, dict) and bool(errors.get("username"))
+    blob = _username_error_blob(errors if errors is not None else payload)
+    taken_code = has_username_error or any(code in blob for code in _USERNAME_TAKEN_CODES)
 
-    # status: fail yoki available: false -> TAKEN
-    if available is False:
-        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "app_check"}
+    if taken_code:
+        return {
+            "kind": "ok",
+            "status": CheckStatus.TAKEN,
+            "source": "signup_taken",
+        }
 
     status_field = str(payload.get("status") or "").lower()
-    if status_field == "fail":
-        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "app_check"}
+    username_field_missing = not (isinstance(errors, dict) and "username" in errors)
 
-    # username_is_taken matnini ham tekshir
-    blob = json.dumps(payload, ensure_ascii=False).lower()
-    if "username_is_taken" in blob or "username_held" in blob:
-        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "app_check"}
+    if status_field == "ok" and username_field_missing:
+        return {
+            "kind": "ok",
+            "status": CheckStatus.AVAILABLE,
+            "source": "signup_available",
+        }
 
-    # Noma'lum holat — ehtiyot tomoni: retry
-    return {"kind": "retry", "rate_limited": False,
-            "error": f"App check noma'lum javob (HTTP {status_code}): {list(payload.keys())}"}
+    if payload.get("dryrun_passed") is True:
+        return {
+            "kind": "ok",
+            "status": CheckStatus.AVAILABLE,
+            "source": "signup_available",
+        }
 
+    return {
+        "kind": "fallback",
+        "error": f"Signup noma'lum javob (HTTP {status_code}): {list(payload.keys())}",
+    }
 
-# ─── Asosiy tekshiruvchi sinf ──────────────────────────────────────────────────
 
 class InstagramChecker:
-    """
-    Instagram username mavjudligini tekshiradi.
-
-    Funnel:
-      1) topsearch exact match  -> TAKEN
-      2) Android App API        -> AVAILABLE / TAKEN
-      3) Zaxira (tarmoq xato)   -> profil GET HTML marker -> TAKEN / AVAILABLE
-    """
+    """Instagram username mavjudligini 3-bosqichli funnel orqali tekshiradi."""
 
     def __init__(self, proxy_url: str | None = None) -> None:
         self._base_proxy: str | None = proxy_url or (
@@ -356,23 +449,19 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=topsearch+app_check_username",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=topsearch+signup+html",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
         )
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (topsearch + Android App API) | proxy=%s",
+            "InstagramChecker ishga tushdi (topsearch + web signup) | proxy=%s",
             bool(self._base_proxy),
         )
 
     async def stop(self) -> None:
         logger.info("InstagramChecker to'xtatildi.")
-
-    def _get_session_proxy(self) -> str | None:
-        """Har chaqiruvda yangi DataImpulse sessiya ID = yangi IP."""
-        return _make_session_proxy(self._base_proxy)
 
     def _session_kwargs(self, proxy: str | None) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
@@ -390,11 +479,11 @@ class InstagramChecker:
     async def check_username(
         self,
         username: str,
-        max_retries: int = _MAX_RETRIES,
+        max_retries: int = 1,  # noqa: ARG002 — API mosligi; 429 loop yo'q
     ) -> CheckResult:
         """
         Username holatini tekshiradi.
-        Qaytadi: CheckResult — result.to_dict() -> {"status": "available"|"taken"|"error", ...}
+        Instagram tarmoq/429 xatolari hech qachon CheckStatus.ERROR qaytarmaydi.
         """
         username_clean = username.strip().lstrip("@").lower()
 
@@ -407,86 +496,29 @@ class InstagramChecker:
             )
 
         if username_clean in self._checking_usernames:
-            logger.warning("[@%s] Parallel tekshiruv bloklandi.", username_clean)
-            return CheckResult(
-                username=username_clean,
-                status=CheckStatus.ERROR,
-                error_message="Parallel tekshiruv bloklandi",
-                attempts=0,
-            )
+            logger.warning("[@%s] Parallel tekshiruv — davom etiladi.", username_clean)
 
         self._checking_usernames.add(username_clean)
         try:
-            return await self._check_with_retries(username_clean, max_retries)
-        except Exception as exc:
-            logger.exception("[@%s] Ushlanmagan xato", username_clean)
+            await asyncio.sleep(
+                random.uniform(settings.check_delay_min, settings.check_delay_max)
+            )
+            sticky_proxy = _make_session_proxy(self._base_proxy)
+            result = await self._funnel_check(username_clean, sticky_proxy)
+            status: CheckStatus = result["status"]
+            source = result.get("source", "unknown")
+            logger.info("[@%s] %s (%s)", username_clean, status.value, source)
+            return CheckResult(username=username_clean, status=status, attempts=1)
+        except Exception:
+            logger.exception("[@%s] Ushlanmagan xato -> TAKEN", username_clean)
             return CheckResult(
                 username=username_clean,
-                status=CheckStatus.ERROR,
-                error_message=f"{type(exc).__name__}: {exc}",
-                attempts=max_retries,
+                status=CheckStatus.TAKEN,
+                error_message=None,
+                attempts=1,
             )
         finally:
             self._checking_usernames.discard(username_clean)
-
-    async def _check_with_retries(self, username: str, max_retries: int) -> CheckResult:
-        last_error = "Noma'lum xato"
-
-        for attempt in range(1, max_retries + 1):
-            session_proxy = self._get_session_proxy()
-            skip_topsearch = attempt > 1
-            logger.debug(
-                "[@%s] Urinish %d/%d | skip_topsearch=%s",
-                username, attempt, max_retries, skip_topsearch,
-            )
-
-            delay = (
-                random.uniform(settings.check_delay_min, settings.check_delay_max)
-                if attempt == 1
-                else random.uniform(0.35, 0.9)
-            )
-            await asyncio.sleep(delay)
-
-            try:
-                result = await self._funnel_check(
-                    username, session_proxy, skip_topsearch=skip_topsearch
-                )
-            except _NETWORK_EXCEPTIONS as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                logger.warning("[@%s] Tarmoq xatosi [%s] (%d/%d): %s",
-                               username, type(exc).__name__, attempt, max_retries, exc)
-                continue
-            except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                logger.warning("[@%s] Kutilmagan xato [%s] (%d/%d): %s",
-                               username, type(exc).__name__, attempt, max_retries, exc)
-                continue
-
-            if result["kind"] == "ok":
-                status: CheckStatus = result["status"]
-                source = result.get("source", "unknown")
-                logger.info("[@%s] %s (%s)", username, status.value, source)
-                return CheckResult(username=username, status=status, attempts=attempt)
-
-            last_error = str(result.get("error") or last_error)
-
-            if result.get("rate_limited"):
-                delay = _backoff_delay(attempt)
-                logger.warning("[@%s] HTTP 429 | backoff %.1fs | %d/%d",
-                               username, delay, attempt, max_retries)
-                await asyncio.sleep(delay)
-                continue
-
-            logger.warning("[@%s] %s (%d/%d)", username, last_error, attempt, max_retries)
-
-        logger.error("[@%s] Barcha %d urinish muvaffaqiyatsiz | %s",
-                     username, max_retries, last_error)
-        return CheckResult(
-            username=username,
-            status=CheckStatus.ERROR,
-            error_message=last_error,
-            attempts=max_retries,
-        )
 
     async def _request(
         self,
@@ -494,7 +526,7 @@ class InstagramChecker:
         method: str,
         url: str,
         headers: dict[str, str],
-        data: dict[str, str] | None = None,
+        data: dict[str, str] | str | None = None,
     ) -> Any:
         kwargs: dict[str, Any] = {
             "headers": headers,
@@ -507,7 +539,15 @@ class InstagramChecker:
             return await session.post(url, data=data or {}, **kwargs)
         return await session.get(url, **kwargs)
 
-    # ── 1-bosqich: topsearch ──────────────────────────────────────────────────
+    async def _warm_csrf(self, session: AsyncSession, username: str) -> str:
+        try:
+            resp = await self._request(session, "GET", _SIGNUP_PAGE_URL, _HTML_HEADERS)
+        except _NETWORK_EXCEPTIONS as exc:
+            logger.warning("[@%s] CSRF warmup xato: %s", username, exc)
+            return _csrf_from_session(session) or "missing"
+
+        token = _csrf_from_session(session) or _csrf_from_html(_body_text(resp))
+        return token or "missing"
 
     async def _try_topsearch(
         self,
@@ -516,221 +556,144 @@ class InstagramChecker:
         search_url: str,
     ) -> dict[str, Any]:
         """
-        kind=ok       -> TAKEN (aniq match topildi)
-        kind=continue -> JSON OK, match yo'q — keyingi bosqichga
-        kind=skip     -> tarmoq/429 xato — keyingi bosqichga
+        kind=ok       -> TAKEN (aniq match)
+        kind=continue -> match yo'q yoki 429/xato — Tier 2 ga
         """
         try:
-            resp = await self._request(session, "GET", search_url, _SEARCH_HEADERS)
+            resp = await self._request(session, "GET", search_url, _JSON_HEADERS)
         except _NETWORK_EXCEPTIONS as exc:
             logger.warning("[@%s] topsearch xato: %s", username, exc)
-            return {"kind": "skip", "error": f"{type(exc).__name__}: {exc}"}
+            return {"kind": "continue", "error": f"{type(exc).__name__}: {exc}"}
 
         if _is_wrong_origin(resp):
-            return {"kind": "skip", "error": "Proxy noto'g'ri origin (topsearch)"}
+            logger.warning("[@%s] topsearch noto'g'ri origin", username)
+            return {"kind": "continue", "error": "Proxy noto'g'ri origin (topsearch)"}
 
-        sc = int(getattr(resp, "status_code", 0) or 0)
-        if sc == 429:
-            logger.warning("[@%s] topsearch HTTP 429", username)
-            return {"kind": "skip", "rate_limited": True,
-                    "error": "HTTP 429 Rate Limited (topsearch)"}
+        status_code = int(getattr(resp, "status_code", 0) or 0)
+        if status_code == 429:
+            logger.warning("[@%s] topsearch HTTP 429 -> Tier 2", username)
+            return {"kind": "continue", "error": "HTTP 429 Rate Limited (topsearch)"}
 
         payload = _parse_json_body(resp)
         if payload is None:
-            return {"kind": "skip", "error": f"topsearch JSON emas (HTTP {sc})"}
+            return {"kind": "continue", "error": f"topsearch JSON emas (HTTP {status_code})"}
 
         if _exact_username_in_search(payload, username):
-            logger.debug("[@%s] topsearch: exact match -> TAKEN", username)
             return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "topsearch"}
 
-        logger.debug("[@%s] topsearch: match yo'q -> app check", username)
         return {"kind": "continue"}
 
-    # ── 2-bosqich: Android App API ────────────────────────────────────────────
-
-    async def _try_app_check(
+    async def _try_signup_attempt(
         self,
+        session: AsyncSession,
         username: str,
-        proxy: str | None,
+        csrf_token: str,
     ) -> dict[str, Any]:
         """
-        POST https://i.instagram.com/api/v1/users/check_username/
-        Android App User-Agent bilan.
-
-        kind=ok (AVAILABLE) -> available: true
-        kind=ok (TAKEN)     -> available: false / status: fail
-        kind=retry          -> 429 / tarmoq xato / JSON emas
+        kind=ok       -> TAKEN / AVAILABLE
+        kind=fallback -> 429 / SSL / ishonchsiz javob
         """
-        # Sticky sessiya: GET va POST bir xil IP dan — bu yerda faqat POST bor
-        sticky_proxy = _make_session_proxy(self._base_proxy) if self._base_proxy else proxy
-        kwargs = self._session_kwargs(sticky_proxy)
-        async with AsyncSession(**kwargs) as session:
-            try:
-                resp = await self._request(
-                    session,
-                    "POST",
-                    _APP_CHECK_URL,
-                    _APP_CHECK_HEADERS,
-                    data={"username": username},
-                )
-            except _NETWORK_EXCEPTIONS as exc:
-                logger.warning("[@%s] app check tarmoq/timeout/SSL: %s", username, exc)
-                return {"kind": "retry", "rate_limited": True,
-                        "error": f"{type(exc).__name__}: {exc}"}
-
-            if _is_wrong_origin(resp):
-                return {"kind": "retry", "rate_limited": False,
-                        "error": "Proxy noto'g'ri origin (app check)"}
-
-            sc = int(getattr(resp, "status_code", 0) or 0)
-            payload = _parse_json_body(resp)
-            logger.debug(
-                "[@%s] app check POST -> HTTP %d | available=%s | status=%s",
-                username, sc,
-                payload.get("available") if payload else None,
-                payload.get("status") if payload else None,
+        headers = {
+            **_SIGNUP_POST_HEADERS,
+            "X-CSRFToken": csrf_token or "missing",
+        }
+        rnd = secrets.token_hex(4)
+        body = (
+            f"email=test_valid_check_{rnd}@gmail.com"
+            f"&username={quote(username, safe='._')}"
+            f"&first_name=&opt_into_one_tap=false"
+        )
+        try:
+            resp = await self._request(
+                session, "POST", _SIGNUP_ATTEMPT_URL, headers, data=body,
             )
-            return _classify_app_check(sc, payload)
+        except _NETWORK_EXCEPTIONS as exc:
+            logger.warning("[@%s] signup tarmoq/SSL: %s", username, exc)
+            return {"kind": "fallback", "error": f"{type(exc).__name__}: {exc}"}
 
-    # ── 3-bosqich: Profil GET zaxira ──────────────────────────────────────────
+        if _is_wrong_origin(resp):
+            return {"kind": "fallback", "error": "Proxy noto'g'ri origin (signup)"}
+
+        status_code = int(getattr(resp, "status_code", 0) or 0)
+        payload = _parse_json_body(resp)
+        logger.debug(
+            "[@%s] signup POST -> HTTP %d | status=%s | errors=%s",
+            username,
+            status_code,
+            payload.get("status") if payload else None,
+            list((payload.get("errors") or {}).keys())
+            if payload and isinstance(payload.get("errors"), dict)
+            else None,
+        )
+        return _classify_signup_attempt(status_code, payload)
 
     async def _try_profile_fallback(
         self,
+        session: AsyncSession,
         username: str,
-        proxy: str | None,
     ) -> dict[str, Any]:
-        """
-        App check 429 yoki tarmoq xatosi bo'lganda profil GET zaxirasi.
-
-        kind=ok (TAKEN)
-          source=profile_marker       -> HTML da faol profil teglari topildi
-          source=profile_deactive_200 -> HTTP 200 lekin marker yo'q
-                                         (deactive / banned akkauntlar shunday beradi)
-        kind=ok (AVAILABLE)
-          source=profile_404          -> HTTP 404 yoki "Page Not Found"
-        kind=skip -> tarmoq/429 xato, ham bo'lmadi -> yuqori qatlamga
-        """
         profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
-        sticky_proxy = _make_session_proxy(self._base_proxy) if self._base_proxy else proxy
-        kwargs = self._session_kwargs(sticky_proxy)
-        async with AsyncSession(**kwargs) as session:
-            try:
-                resp = await self._request(session, "GET", profile_url, _PROFILE_HEADERS)
-            except _NETWORK_EXCEPTIONS as exc:
-                logger.warning("[@%s] profil GET zaxira tarmoq/SSL: %s", username, exc)
-                return {"kind": "skip", "error": f"{type(exc).__name__}: {exc}"}
+        try:
+            resp = await self._request(session, "GET", profile_url, _HTML_HEADERS)
+        except _NETWORK_EXCEPTIONS as exc:
+            logger.warning("[@%s] profil GET zaxira tarmoq/SSL: %s", username, exc)
+            return {"kind": "skip", "error": f"{type(exc).__name__}: {exc}"}
 
-            if _is_wrong_origin(resp):
-                return {"kind": "skip", "error": "Proxy noto'g'ri origin (profile fallback)"}
+        if _is_wrong_origin(resp):
+            return {"kind": "skip", "error": "Proxy noto'g'ri origin (profile fallback)"}
 
-            sc = int(getattr(resp, "status_code", 0) or 0)
-            if sc == 429:
-                return {"kind": "skip", "rate_limited": True,
-                        "error": "HTTP 429 Rate Limited (profile fallback)"}
+        status_code = int(getattr(resp, "status_code", 0) or 0)
+        if status_code == 429:
+            return {"kind": "skip", "error": "HTTP 429 Rate Limited (profile fallback)"}
 
-            html = _body_text(resp)
-            final_url = str(getattr(resp, "url", "") or "")
-
-            # ── Faol profil markerlari bor -> TAKEN ───────────────────────────
-            if _html_proves_existing_profile(html, username, final_url):
-                logger.info("[@%s] profil zaxira: marker topildi -> TAKEN", username)
-                return {"kind": "ok", "status": CheckStatus.TAKEN,
-                        "source": "profile_marker"}
-
-            # ── HTTP 404 yoki "Page Not Found" -> AVAILABLE ───────────────────
-            lower = html.lower()
-            is_page_not_found = (
-                sc == 404
-                or "sorry, this page isn't available" in lower
-                or "page not found" in lower
-                or "the link you followed may be broken" in lower
-            )
-            if is_page_not_found:
-                logger.info("[@%s] profil zaxira: 404/Page Not Found -> AVAILABLE", username)
-                return {"kind": "ok", "status": CheckStatus.AVAILABLE,
-                        "source": "profile_404"}
-
-            # ── HTTP 200 lekin marker yo'q -> TAKEN (deactive/banned) ─────────
-            # Instagram mavjud bo'lmagan nomlar 404 beradi.
-            # 200 + marker yo'q = akkaunt o'chiq (deactive/ban/lock).
-            if sc == 200:
-                logger.info(
-                    "[@%s] profil zaxira: HTTP 200, marker yo'q -> TAKEN (deactive/ban)",
-                    username,
-                )
-                return {"kind": "ok", "status": CheckStatus.TAKEN,
-                        "source": "profile_deactive_200"}
-
-            # ── Noma'lum status -> TAKEN (ehtiyot tomoni) ─────────────────────
-            logger.info(
-                "[@%s] profil zaxira: HTTP %d noma'lum -> TAKEN (xavfsiz)", username, sc,
-            )
-            return {"kind": "ok", "status": CheckStatus.TAKEN,
-                    "source": "profile_deactive_200"}
-
-    # ── Asosiy funnel ─────────────────────────────────────────────────────────
-
-    async def _funnel_check(
-        self,
-        username: str,
-        proxy: str | None,
-        skip_topsearch: bool = False,
-    ) -> dict[str, Any]:
-        """
-        1) topsearch exact match   -> TAKEN
-        2) Android App API check   -> AVAILABLE / TAKEN
-        3) App 429 yoki tarmoq xato bo'lsa darhol profil GET zaxirasi:
-             marker       -> TAKEN  (source: profile_marker)
-             404/not found-> AVAILABLE  (source: profile_404)
-             200/no marker-> TAKEN  (source: profile_deactive_200)
-             zaxira ham skip -> TAKEN (hech qachon ERROR emas)
-        """
-        search_url = _TOPSEARCH_URL.format(query=quote(username, safe="._"))
-
-        # ── 1-bosqich: topsearch ──────────────────────────────────────────────
-        if not skip_topsearch:
-            kwargs = self._session_kwargs(proxy)
-            async with AsyncSession(**kwargs) as session:
-                ts = await self._try_topsearch(session, username, search_url)
-            if ts["kind"] == "ok":
-                return ts
-            # skip yoki continue — app check ga o't
-        else:
-            logger.debug("[@%s] retry: topsearch o'tkazildi", username)
-
-        # ── 2-bosqich: Android App API ────────────────────────────────────────
-        app_result = await self._try_app_check(username, proxy)
-
-        if app_result["kind"] == "ok":
-            return app_result
-
-        # App check xato (429 yoki tarmoq) -> DARHOL profil GET zaxirasi
-        # Loop ga qaytmaslik uchun bu yerda hal qilinadi
-        err_msg = app_result.get("error", "app check xato")
-        is_rate = app_result.get("rate_limited", False)
+        html = _body_text(resp)
+        final_url = str(getattr(resp, "url", "") or "")
+        location = _header_get(getattr(resp, "headers", None), "location")
+        classified = _classify_profile_fallback(status_code, html, final_url, location)
         logger.info(
-            "[@%s] app check %s (%s) -> profil GET zaxirasi",
+            "[@%s] profil zaxira HTTP %d -> %s (%s)",
             username,
-            "HTTP 429" if is_rate else "xato",
-            err_msg,
+            status_code,
+            classified["status"].value,
+            classified["source"],
         )
+        return classified
 
-        # ── 3-bosqich: profil GET zaxira ──────────────────────────────────────
-        fallback = await self._try_profile_fallback(username, proxy)
-        if fallback["kind"] == "ok":
-            return fallback
+    async def _funnel_check(self, username: str, proxy: str | None) -> dict[str, Any]:
+        search_url = _TOPSEARCH_URL.format(query=quote(username, safe="._"))
+        kwargs = self._session_kwargs(proxy)
 
-        # Profil zaxira ham skip/xato bo'ldi -> TAKEN (eng xavfsiz tomon)
-        # Foydalanuvchi hech qachon ERROR ko'rmasin
-        logger.warning(
-            "[@%s] profil zaxira ham xato (%s) -> TAKEN (xavfsiz yopish)",
-            username, fallback.get("error"),
-        )
-        return {
-            "kind": "ok",
-            "status": CheckStatus.TAKEN,
-            "source": "ultimate_fallback",
-        }
+        async with AsyncSession(**kwargs) as session:
+            csrf_token = await self._warm_csrf(session, username)
+
+            topsearch = await self._try_topsearch(session, username, search_url)
+            if topsearch["kind"] == "ok":
+                return topsearch
+
+            signup = await self._try_signup_attempt(session, username, csrf_token)
+            if signup["kind"] == "ok":
+                return signup
+
+            logger.info(
+                "[@%s] signup fallback (%s) -> HTML",
+                username,
+                signup.get("error", "noma'lum"),
+            )
+
+            fallback = await self._try_profile_fallback(session, username)
+            if fallback.get("kind") == "ok":
+                return fallback
+
+            logger.warning(
+                "[@%s] profil zaxira ham xato (%s) -> TAKEN",
+                username,
+                fallback.get("error"),
+            )
+            return {
+                "kind": "ok",
+                "status": CheckStatus.TAKEN,
+                "source": "ultimate_fallback",
+            }
 
 
 instagram_checker = InstagramChecker()
