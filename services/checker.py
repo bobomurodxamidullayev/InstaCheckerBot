@@ -33,7 +33,7 @@ from models.username_log import CheckStatus
 logger = logging.getLogger(__name__)
 
 _OEMBED_URL = "https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/{username}/"
-_WEB_PROFILE_URL = "https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+_REGISTRATION_CHECK_URL = "https://i.instagram.com/api/v1/accounts/check_username/"
 
 _REQUEST_TIMEOUT = 6.0
 _IMPERSONATE = "chrome124"
@@ -47,11 +47,11 @@ _OEMBED_HEADERS: dict[str, str] = {
     "Accept": "application/json",
 }
 
-_WEB_PROFILE_HEADERS: dict[str, str] = {
-    "User-Agent": _CHROME_USER_AGENT,
+_REGISTRATION_HEADERS: dict[str, str] = {
+    "User-Agent": "Instagram 269.0.0.18.75 Android (30/11; 480dpi; 1080x2176; Xiaomi; Mi A3; laurel_sprout; qcom; ru_RU; 314665256)",
+    "Accept-Language": "en-US",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     "X-IG-App-ID": "936619743392459",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
 }
 
 _NETWORK_EXCEPTIONS = (
@@ -152,14 +152,14 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=oembed+web_profile",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=oembed+registration",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
         )
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (oEmbed + web_profile) | proxy=%s",
+            "InstagramChecker ishga tushdi (oEmbed + registration) | proxy=%s",
             bool(self._base_proxy),
         )
 
@@ -275,7 +275,7 @@ class InstagramChecker:
         except _NETWORK_EXCEPTIONS as exc:
             return {
                 "kind": "check_required",
-                "error": f"oEmbed unavailable; proceeding to web profile check: {exc}",
+                "error": f"oEmbed unavailable; proceeding to registration check: {exc}",
             }
 
         status_code = int(getattr(resp, "status_code", 0) or 0)
@@ -288,53 +288,38 @@ class InstagramChecker:
             return {"kind": "check_required", "error": "oEmbed profile not found"}
         return {"kind": "error", "error": f"oEmbed unexpected status: {status_code}"}
 
-    async def _try_web_profile(
+    async def _try_registration_check(
         self,
         session: AsyncSession,
         username: str,
     ) -> dict[str, Any]:
-        profile_url = _WEB_PROFILE_URL.format(username=quote(username, safe="._"))
-        headers = {
-            **_WEB_PROFILE_HEADERS,
-            "Referer": f"https://www.instagram.com/{username}/",
-        }
+        headers = _REGISTRATION_HEADERS
         try:
             response = await self._request(
                 session,
-                "GET",
-                profile_url,
+                "POST",
+                _REGISTRATION_CHECK_URL,
                 headers,
-                allow_redirects=False,
+                data={"username": username},
             )
         except _NETWORK_EXCEPTIONS as exc:
             return {
                 "kind": "error",
-                "error": f"web profile network error: {exc}",
+                "error": f"registration check network error: {exc}",
             }
 
-        status_code = int(getattr(response, "status_code", 0) or 0)
-        headers_obj = getattr(response, "headers", {})
-        location = str(headers_obj.get("Location", "") or "").lower()
-        if any(marker in location for marker in ("checkpoint", "login")):
-            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
-
-        if status_code == 404:
-            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "web_available"}
-
+        raw_text = _body_text(response)
         payload = _parse_json_body(response)
-        data = payload.get("data") if isinstance(payload, dict) else None
-        user = data.get("user") if isinstance(data, dict) else None
-        if status_code == 200:
-            if isinstance(user, dict) and user.get("id"):
-                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "web_active"}
-            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
-
-        if status_code in (400, 401, 403) or 300 <= status_code < 400:
-            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
+        if payload and payload.get("available") is True:
+            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "reg_available"}
+        if (
+            payload and payload.get("available") is False
+        ) or "username_is_taken" in raw_text:
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "reg_taken_or_banned"}
 
         return {
             "kind": "error",
-            "error": f"web profile inconclusive: status={status_code}",
+            "error": f"registration check inconclusive: status={getattr(response, 'status_code', 0)}",
         }
 
     async def _funnel_check(self, username: str, proxy: str | None) -> dict[str, Any]:
@@ -346,7 +331,7 @@ class InstagramChecker:
             if oembed["kind"] != "check_required":
                 return oembed
 
-            return await self._try_web_profile(session, username)
+            return await self._try_registration_check(session, username)
 
 
 instagram_checker = InstagramChecker()
