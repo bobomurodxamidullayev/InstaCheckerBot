@@ -87,27 +87,11 @@ _NETWORK_EXCEPTIONS = (
 )
 
 _USERNAME_RE = re.compile(r"^[a-z0-9._]{1,30}$")
-
-# Instagram bo'sh profil sahifasi (HTTP 200/302 bo'lsa ham)
-_NOT_FOUND_MARKERS: tuple[str, ...] = (
-    "sorry, this page isn't available",
-    "sorry, this page isn’t available",
-    "the link you followed may be broken",
-    "page not found",
-    "page not found • instagram",
-    "page not found &bull; instagram",
-    "this page isn't available",
-    "this page isn’t available",
-)
-
-_PROFILE_MARKERS: tuple[str, ...] = (
-    'property="og:type" content="profile"',
-    "property='og:type' content='profile'",
-    'content="profile" property="og:type"',
-    '"og:type":"profile"',
-    '"profilepage"',
-    '"logging_page_id":"profilepage_',
-    '"isa_user":',
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_OG_TYPE_RE = re.compile(
+    r'<meta[^>]+(?:property|name)=["\']og:type["\'][^>]+content=["\']([^"\']+)["\']'
+    r"|<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\']og:type["\']",
+    re.IGNORECASE,
 )
 
 
@@ -249,37 +233,36 @@ def _html_text(response: Any) -> str:
     return str(content or "")
 
 
-def _has_not_found_html(html: str) -> bool:
-    lowered = html.lower()
-    return any(marker in lowered for marker in _NOT_FOUND_MARKERS)
+def _is_login_redirect(final_url: str, html: str) -> bool:
+    del html  # faqat yakuniy URL — navbardagi login linki available sahifani buzmasin
+    return "/accounts/login" in (final_url or "").lower()
 
 
 def _has_real_profile_html(html: str, username: str) -> bool:
+    """Faqat aniq profil metateglari — bo'sh React shell bunda yo'q."""
+    if not html:
+        return False
+
     lowered = html.lower()
-    if any(marker in lowered for marker in _PROFILE_MARKERS):
+    uname = username.lower()
+
+    og_type = None
+    og_match = _OG_TYPE_RE.search(html)
+    if og_match:
+        og_type = (og_match.group(1) or og_match.group(2) or "").strip().lower()
+    if og_type == "profile":
+        return True
+    if re.search(r'"og:type"\s*:\s*"profile"', lowered):
         return True
 
-    uname = username.lower()
-    title_match = re.search(r"<title[^>]*>(.*?)</title>", lowered, re.IGNORECASE | re.DOTALL)
+    if "instapp:owner_user_id" in lowered:
+        return True
+
+    title_match = _TITLE_RE.search(html)
     if title_match:
         title = re.sub(r"\s+", " ", title_match.group(1))
-        if f"@{uname}" in title and "page not found" not in title:
+        if re.search(rf"\(@{re.escape(uname)}\)", title, re.IGNORECASE):
             return True
-        if uname in title and "instagram" in title and "page not found" not in title:
-            if "followers" in lowered or "following" in lowered:
-                return True
-
-    if re.search(rf'"username"\s*:\s*"{re.escape(uname)}"', lowered):
-        if "profilepage" in lowered or "edge_followed_by" in lowered or "is_private" in lowered:
-            return True
-
-    og_url = re.search(
-        r'property=["\']og:url["\']\s+content=["\']([^"\']+)["\']',
-        lowered,
-        re.IGNORECASE,
-    )
-    if og_url and f"instagram.com/{uname}" in og_url.group(1):
-        return True
 
     return False
 
@@ -291,8 +274,9 @@ def _classify_profile_response(
     final_url: str,
 ) -> tuple[str, Any]:
     """
-    HTTP status + HTML -> (kind, payload).
-    kind: ok | retry
+    Profil metategi bor -> taken.
+    Metateg yo'q (bo'sh Instagram shell) -> available.
+    Retry faqat 429 / login wall / server xatosi.
     """
     if status_code == 429:
         return "retry", {
@@ -300,44 +284,23 @@ def _classify_profile_response(
             "error": "HTTP 429 Rate Limited (profile GET)",
         }
 
-    if status_code in (404, 410):
-        return "ok", CheckStatus.AVAILABLE
-
-    if status_code >= 500:
+    if status_code >= 500 or status_code in (401, 403):
         return "retry", {
             "rate_limited": False,
-            "error": f"HTTP {status_code} (server)",
+            "error": f"HTTP {status_code} (server/block)",
         }
-
-    if status_code in (401, 403) and not html:
-        return "retry", {
-            "rate_limited": False,
-            "error": f"HTTP {status_code} (blocked, bo'sh javob)",
-        }
-
-    if _has_not_found_html(html):
-        return "ok", CheckStatus.AVAILABLE
 
     if _has_real_profile_html(html, username):
         return "ok", CheckStatus.TAKEN
 
-    lowered_url = (final_url or "").lower()
-    if "/accounts/login" in lowered_url or "/accounts/suspended" in lowered_url:
+    if _is_login_redirect(final_url, html):
         return "retry", {
             "rate_limited": False,
-            "error": "Login/consent sahifasi — profil belgisi yo'q",
+            "error": "Login redirect — profil metategi yo'q",
         }
 
-    if status_code in (200, 201) and html.strip():
-        return "retry", {
-            "rate_limited": False,
-            "error": "HTML da na not-found, na profil belgisi",
-        }
-
-    return "retry", {
-        "rate_limited": False,
-        "error": f"Aniqlanmadi HTTP {status_code}",
-    }
+    # 404, 200 bo'sh shell, client-side not-found — profil signali yo'q = available
+    return "ok", CheckStatus.AVAILABLE
 
 
 # ─── Asosiy tekshiruvchi sinf ──────────────────────────────────────────────────
