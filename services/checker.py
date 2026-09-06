@@ -1,8 +1,4 @@
-"""Instagram username tekshirish servisi.
-
-oEmbed identifies active accounts; the native mobile endpoint handles the
-remaining 404 case without web redirects or HTML parsing.
-"""
+"""Instagram username tekshirish servisi."""
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +7,6 @@ import logging
 import random
 import re
 import secrets
-import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import quote, unquote, urlparse, urlunparse
@@ -38,8 +33,7 @@ from models.username_log import CheckStatus
 logger = logging.getLogger(__name__)
 
 _OEMBED_URL = "https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/{username}/"
-_SIGNUP_PAGE_URL = "https://www.instagram.com/accounts/emailsignup/"
-_SIGNUP_ATTEMPT_URL = "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
+_WEB_PROFILE_URL = "https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
 
 _REQUEST_TIMEOUT = 20.0
 _IMPERSONATE = "chrome124"
@@ -53,20 +47,11 @@ _OEMBED_HEADERS: dict[str, str] = {
     "Accept": "application/json",
 }
 
-_SIGNUP_PAGE_HEADERS: dict[str, str] = {
+_WEB_PROFILE_HEADERS: dict[str, str] = {
     "User-Agent": _CHROME_USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-_SIGNUP_HEADERS: dict[str, str] = {
-    "User-Agent": _CHROME_USER_AGENT,
-    "X-CSRFToken": "missing",
     "X-IG-App-ID": "936619743392459",
-    "X-ASBD-ID": "129477",
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": _SIGNUP_PAGE_URL,
-    "Content-Type": "application/x-www-form-urlencoded",
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 _NETWORK_EXCEPTIONS = (
@@ -159,7 +144,7 @@ def _parse_json_body(response: Any) -> dict[str, Any] | None:
 
 
 class InstagramChecker:
-    """Instagram username mavjudligini oEmbed va signup validation orqali tekshiradi."""
+    """Instagram username mavjudligini oEmbed va web profile API orqali tekshiradi."""
 
     def __init__(self, proxy_url: str | None = None) -> None:
         self._base_proxy: str | None = proxy_url or (
@@ -167,14 +152,14 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=oembed+signup",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=oembed+web_profile",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
         )
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (oEmbed + signup) | proxy=%s",
+            "InstagramChecker ishga tushdi (oEmbed + web_profile) | proxy=%s",
             bool(self._base_proxy),
         )
 
@@ -285,9 +270,7 @@ class InstagramChecker:
             resp = await self._request(session, "GET", oembed_url, _OEMBED_HEADERS)
         except _NETWORK_EXCEPTIONS as exc:
             return {
-                "kind": "ok",
-                "status": CheckStatus.TAKEN,
-                "source": "safe_taken",
+                "kind": "error",
                 "error": f"oEmbed network error: {exc}",
             }
 
@@ -296,80 +279,54 @@ class InstagramChecker:
             payload = _parse_json_body(resp)
             if payload and ("author_name" in payload or "author_id" in payload):
                 return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "oembed_active"}
-            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_taken"}
+            return {"kind": "error", "error": "oEmbed response missing account identity"}
         if status_code == 404:
             return {"kind": "check_required", "error": "oEmbed profile not found"}
-        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_taken"}
+        return {"kind": "error", "error": f"oEmbed unexpected status: {status_code}"}
 
-    async def _try_signup(
+    async def _try_web_profile(
         self,
+        session: AsyncSession,
         username: str,
-        proxy: str | None,
     ) -> dict[str, Any]:
-        session_kwargs = self._session_kwargs(proxy)
-        session_kwargs["headers"] = _SIGNUP_PAGE_HEADERS
-        response: Any = None
+        profile_url = _WEB_PROFILE_URL.format(username=quote(username, safe="._"))
+        headers = {
+            **_WEB_PROFILE_HEADERS,
+            "Referer": f"https://www.instagram.com/{username}/",
+        }
         try:
-            async with AsyncSession(**session_kwargs) as session:
-                await self._request(
-                    session,
-                    "GET",
-                    _SIGNUP_PAGE_URL,
-                    _SIGNUP_PAGE_HEADERS,
-                )
-                csrf_token = session.cookies.get("csrftoken") or "missing"
-                headers = {**_SIGNUP_HEADERS, "X-CSRFToken": csrf_token}
-                response = await self._request(
-                    session,
-                    "POST",
-                    _SIGNUP_ATTEMPT_URL,
-                    headers,
-                    data={
-                        "email": f"chk_{uuid.uuid4().hex[:10]}@gmail.com",
-                        "username": username,
-                        "first_name": "",
-                        "opt_into_one_tap": "false",
-                    },
-                )
+            response = await self._request(session, "GET", profile_url, headers)
         except _NETWORK_EXCEPTIONS as exc:
-            status_code = int(getattr(response, "status_code", 0) or 0)
-            raw_text = _body_text(response) if response is not None else ""
-            logger.warning(
-                "[@%s] signup validation exception | status=%d | body=%r | error=%s",
-                username,
-                status_code,
-                raw_text,
-                exc,
-            )
             return {
-                "kind": "ok",
-                "status": CheckStatus.TAKEN,
-                "source": "safe_fallback",
-                "error": f"signup network error: {exc}",
+                "kind": "error",
+                "error": f"web profile network error: {exc}",
             }
 
         status_code = int(getattr(response, "status_code", 0) or 0)
-        if status_code == 429:
-            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_fallback"}
+        raw_text = _body_text(response)
+        body_lower = raw_text.lower()
+        response_url = str(getattr(response, "url", "") or "").lower()
+        redirect_urls = [str(getattr(item, "url", "") or "").lower() for item in getattr(response, "history", [])]
+        redirect_text = " ".join([response_url, *redirect_urls])
+        if any(path in redirect_text for path in ("/challenge/", "/accounts/login/")):
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
 
         payload = _parse_json_body(response)
-        if not payload:
-            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_fallback"}
+        user = payload.get("data", {}).get("user") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else None
+        if status_code == 200 and user is not None:
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "web_profile_exists"}
 
-        errors = payload.get("errors")
-        if isinstance(errors, dict) and "username" in errors:
-            return {
-                "kind": "ok",
-                "status": CheckStatus.TAKEN,
-                "source": "signup_taken_banned",
-            }
+        banned_markers = ("checkpoint_required", "login_required", "checkpoint", "spam")
+        if status_code in (400, 403) or any(marker in body_lower for marker in banned_markers):
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
 
-        if payload.get("status") == "ok" and not (
-            isinstance(errors, dict) and "username" in errors
-        ):
-            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "signup_available"}
+        if status_code == 404:
+            message = payload.get("message") if isinstance(payload, dict) else None
+            response_status = payload.get("status") if isinstance(payload, dict) else None
+            if (message == "Not Found" and response_status == "fail") or user is None or "not found" in body_lower:
+                return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "web_profile_available"}
 
-        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_fallback"}
+        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "banned_or_deactivated"}
 
     async def _funnel_check(self, username: str, proxy: str | None) -> dict[str, Any]:
         kwargs = self._session_kwargs(proxy)
@@ -380,7 +337,7 @@ class InstagramChecker:
             if oembed["kind"] != "check_required":
                 return oembed
 
-            return await self._try_signup(username, proxy)
+            return await self._try_web_profile(session, username)
 
 
 instagram_checker = InstagramChecker()
