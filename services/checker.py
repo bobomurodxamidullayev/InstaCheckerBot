@@ -1,13 +1,12 @@
 """
 services/checker.py — Instagram username tekshirish servisi.
 
-Strategiya: profil sahifasi GET (registration POST API EMAS).
-  404          -> available
-  200 / 3xx    -> taken
-  429          -> yangi DataImpulse sessiya + exponential backoff
+Strategiya: profil sahifasi GET + HTML tahlil (faqat status_code EMAS).
+  404 yoki not-found HTML  -> available
+  haqiqiy profil belgilari -> taken
+  429                      -> yangi DataImpulse sessiya + exponential backoff
 
-Klient: curl_cffi AsyncSession (impersonate=chrome124, verify=False).
-Proxy HTTPS tunnel sertifikat nomlari mos kelmasa ham so'rov uzilmaydi.
+Klient: curl_cffi AsyncSession (impersonate=chrome124, verify=False, allow_redirects=True).
 
 VPS:
     pip install "curl_cffi>=0.7.1"
@@ -88,6 +87,28 @@ _NETWORK_EXCEPTIONS = (
 )
 
 _USERNAME_RE = re.compile(r"^[a-z0-9._]{1,30}$")
+
+# Instagram bo'sh profil sahifasi (HTTP 200/302 bo'lsa ham)
+_NOT_FOUND_MARKERS: tuple[str, ...] = (
+    "sorry, this page isn't available",
+    "sorry, this page isn’t available",
+    "the link you followed may be broken",
+    "page not found",
+    "page not found • instagram",
+    "page not found &bull; instagram",
+    "this page isn't available",
+    "this page isn’t available",
+)
+
+_PROFILE_MARKERS: tuple[str, ...] = (
+    'property="og:type" content="profile"',
+    "property='og:type' content='profile'",
+    'content="profile" property="og:type"',
+    '"og:type":"profile"',
+    '"profilepage"',
+    '"logging_page_id":"profilepage_',
+    '"isa_user":',
+)
 
 
 # ─── Natija dataclass ──────────────────────────────────────────────────────────
@@ -215,9 +236,62 @@ def _is_wrong_origin(response: Any) -> bool:
     return False
 
 
-def _classify_profile_status(status_code: int, location: str) -> tuple[str, Any]:
+def _html_text(response: Any) -> str:
+    text = getattr(response, "text", None)
+    if isinstance(text, str):
+        return text
+    content = getattr(response, "content", b"")
+    if isinstance(content, (bytes, bytearray)):
+        try:
+            return bytes(content).decode("utf-8", errors="ignore")
+        except Exception:
+            return ""
+    return str(content or "")
+
+
+def _has_not_found_html(html: str) -> bool:
+    lowered = html.lower()
+    return any(marker in lowered for marker in _NOT_FOUND_MARKERS)
+
+
+def _has_real_profile_html(html: str, username: str) -> bool:
+    lowered = html.lower()
+    if any(marker in lowered for marker in _PROFILE_MARKERS):
+        return True
+
+    uname = username.lower()
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", lowered, re.IGNORECASE | re.DOTALL)
+    if title_match:
+        title = re.sub(r"\s+", " ", title_match.group(1))
+        if f"@{uname}" in title and "page not found" not in title:
+            return True
+        if uname in title and "instagram" in title and "page not found" not in title:
+            if "followers" in lowered or "following" in lowered:
+                return True
+
+    if re.search(rf'"username"\s*:\s*"{re.escape(uname)}"', lowered):
+        if "profilepage" in lowered or "edge_followed_by" in lowered or "is_private" in lowered:
+            return True
+
+    og_url = re.search(
+        r'property=["\']og:url["\']\s+content=["\']([^"\']+)["\']',
+        lowered,
+        re.IGNORECASE,
+    )
+    if og_url and f"instagram.com/{uname}" in og_url.group(1):
+        return True
+
+    return False
+
+
+def _classify_profile_response(
+    status_code: int,
+    html: str,
+    username: str,
+    final_url: str,
+) -> tuple[str, Any]:
     """
-    HTTP status -> (kind, payload).
+    HTTP status + HTML -> (kind, payload).
     kind: ok | retry
     """
     if status_code == 429:
@@ -229,32 +303,40 @@ def _classify_profile_status(status_code: int, location: str) -> tuple[str, Any]
     if status_code in (404, 410):
         return "ok", CheckStatus.AVAILABLE
 
-    if status_code in (200, 201):
-        return "ok", CheckStatus.TAKEN
-
-    if 300 <= status_code < 400:
-        # login / consent / accounts redirect = band profil
-        return "ok", CheckStatus.TAKEN
-
-    if status_code in (401, 403):
-        # login wall ba'zan 403 — odatda band username
-        loc = location.lower()
-        if "login" in loc or "accounts" in loc or "consent" in loc:
-            return "ok", CheckStatus.TAKEN
-        return "retry", {
-            "rate_limited": False,
-            "error": f"HTTP {status_code} (blocked)",
-        }
-
     if status_code >= 500:
         return "retry", {
             "rate_limited": False,
             "error": f"HTTP {status_code} (server)",
         }
 
+    if status_code in (401, 403) and not html:
+        return "retry", {
+            "rate_limited": False,
+            "error": f"HTTP {status_code} (blocked, bo'sh javob)",
+        }
+
+    if _has_not_found_html(html):
+        return "ok", CheckStatus.AVAILABLE
+
+    if _has_real_profile_html(html, username):
+        return "ok", CheckStatus.TAKEN
+
+    lowered_url = (final_url or "").lower()
+    if "/accounts/login" in lowered_url or "/accounts/suspended" in lowered_url:
+        return "retry", {
+            "rate_limited": False,
+            "error": "Login/consent sahifasi — profil belgisi yo'q",
+        }
+
+    if status_code in (200, 201) and html.strip():
+        return "retry", {
+            "rate_limited": False,
+            "error": "HTML da na not-found, na profil belgisi",
+        }
+
     return "retry", {
         "rate_limited": False,
-        "error": f"Kutilmagan HTTP {status_code}",
+        "error": f"Aniqlanmadi HTTP {status_code}",
     }
 
 
@@ -293,7 +375,7 @@ class InstagramChecker:
             "timeout": _REQUEST_TIMEOUT,
             "max_clients": 1,
             "verify": False,
-            "allow_redirects": False,
+            "allow_redirects": True,
             "headers": _PROFILE_HEADERS,
         }
         if proxy:
@@ -389,7 +471,7 @@ class InstagramChecker:
 
             if result["kind"] == "ok":
                 status: CheckStatus = result["status"]
-                logger.info("[@%s] %s (HTTP profile)", username, status.value)
+                logger.info("[@%s] %s (HTML profile)", username, status.value)
                 return CheckResult(
                     username=username,
                     status=status,
@@ -447,18 +529,20 @@ class InstagramChecker:
                 url,
                 headers=_PROFILE_HEADERS,
                 timeout=_REQUEST_TIMEOUT,
-                allow_redirects=False,
+                allow_redirects=True,
                 verify=False,
             )
 
         status_code = int(getattr(response, "status_code", 0) or 0)
-        location = _header_get(getattr(response, "headers", None), "location")
+        final_url = str(getattr(response, "url", "") or "")
+        html = _html_text(response)
         logger.debug(
-            "[@%s] GET %s -> HTTP %d loc=%s",
+            "[@%s] GET %s -> HTTP %d final=%s html=%dB",
             username,
             url,
             status_code,
-            location[:120] if location else "-",
+            final_url[:120] or "-",
+            len(html),
         )
 
         if _is_wrong_origin(response):
@@ -468,7 +552,9 @@ class InstagramChecker:
                 "error": "Proxy noto'g'ri origin (Google/boshqa host) qaytardi",
             }
 
-        kind, payload = _classify_profile_status(status_code, location)
+        kind, payload = _classify_profile_response(
+            status_code, html, username, final_url
+        )
         if kind == "ok":
             return {"kind": "ok", "status": payload}
         return {
