@@ -1,19 +1,15 @@
 """
 services/checker.py — Instagram username tekshirish servisi.
 
-Asosiy yo'l: GET /api/v1/users/web_profile_info/?username=...
-  404 / "user not found"     -> available
-  200 + data.user            -> taken  (banned/deactivated ham)
-  400 / 403 (claim/restrict) -> taken
-  429                        -> yangi DataImpulse sessiya + backoff
+Asosiy yo'l: POST /api/v1/web/accounts/web_create_ajax/attempt/
+  username_is_taken / username error -> taken  (banned/deactivated ham)
+  status=ok va username xatosi yo'q  -> available
+  429                                -> yangi DataImpulse sessiya + backoff
 
-Zaxira: HTML profil GET (login-wall / noaniq javob).
+Zaxira: CSRF/challenge bo'lsa web_profile_info, so'ng HTML profil GET.
+  Eslatma: profile 404 banned akkauntni AVAILABLE deb KO'RSATMAYDI.
 
 Klient: curl_cffi AsyncSession (impersonate=chrome124, verify=False).
-
-VPS:
-    pip install "curl_cffi>=0.7.1"
-    pip install -r requirements.txt
 """
 from __future__ import annotations
 
@@ -51,6 +47,8 @@ logger = logging.getLogger(__name__)
 # ─── Konstantlar ──────────────────────────────────────────────────────────────
 
 _PROFILE_URL = "https://www.instagram.com/{username}/"
+_SIGNUP_URL = "https://www.instagram.com/accounts/emailsignup/"
+_ATTEMPT_URL = "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
 _WEB_PROFILE_INFO_URL = (
     "https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
 )
@@ -98,6 +96,15 @@ _NETWORK_EXCEPTIONS = (
     OSError,
 )
 
+_USERNAME_TAKEN_MARKERS: tuple[str, ...] = (
+    "username_is_taken",
+    "this username isn't available",
+    "this username is not available",
+    "username isn't available",
+    "username is not available",
+    "имя пользователя занято",
+    "username is taken",
+)
 _USERNAME_RE = re.compile(r"^[a-z0-9._]{1,30}$")
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 _OG_TYPE_RE = re.compile(
@@ -299,6 +306,144 @@ def _extract_user(payload: dict[str, Any]) -> Any:
     return None
 
 
+def _extract_csrftoken(response: Any, session: Any) -> str | None:
+    for jar in (getattr(response, "cookies", None), getattr(session, "cookies", None)):
+        if jar is None:
+            continue
+        try:
+            token = jar.get("csrftoken")
+        except Exception:
+            token = None
+        if token:
+            return str(token)
+
+    headers = getattr(response, "headers", None)
+    raw_values: list[str] = []
+    if headers is not None:
+        getter = getattr(headers, "get_list", None)
+        if callable(getter):
+            raw_values.extend(getter("set-cookie") or getter("Set-Cookie") or [])
+        else:
+            raw = headers.get("set-cookie") or headers.get("Set-Cookie")
+            if raw:
+                raw_values.append(str(raw))
+    for value in raw_values:
+        match = re.search(r"csrftoken=([^;]+)", value, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    html = _html_text(response)
+    match = re.search(r'"csrf_token"\s*:\s*"([^"]+)"', html)
+    if match:
+        return match.group(1)
+    match = re.search(r"csrf_token=([^&\"']+)", html)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _username_error_blob(payload: dict[str, Any]) -> str:
+    parts: list[str] = []
+    if payload.get("username_is_taken"):
+        parts.append("username_is_taken")
+    errors = payload.get("errors")
+    if isinstance(errors, dict) and "username" in errors:
+        parts.append(json.dumps(errors.get("username"), ensure_ascii=False))
+    parts.append(_json_message(payload))
+    error_type = str(payload.get("error_type") or "")
+    if error_type:
+        parts.append(error_type)
+    return " ".join(parts).lower()
+
+
+def _has_username_taken_signal(payload: dict[str, Any], body: str) -> bool:
+    blob = f"{_username_error_blob(payload)} {body}".lower()
+    if payload.get("username_is_taken") is True:
+        return True
+    errors = payload.get("errors")
+    if isinstance(errors, dict) and errors.get("username"):
+        return True
+    return any(marker in blob for marker in _USERNAME_TAKEN_MARKERS)
+
+
+def _attempt_headers(csrf: str) -> dict[str, str]:
+    return {
+        **_COMMON_HEADERS,
+        "Accept": "*/*",
+        "X-IG-App-ID": _IG_APP_ID,
+        "X-CSRFToken": csrf or "",
+        "X-Requested-With": "XMLHttpRequest",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Referer": _SIGNUP_URL,
+        "Origin": "https://www.instagram.com",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+
+
+def _classify_attempt_response(
+    status_code: int,
+    payload: dict[str, Any] | None,
+    response: Any,
+    body: str,
+) -> dict[str, Any]:
+    """
+    Registration attempt JSON.
+    kind: ok | retry | fallback
+    """
+    if status_code == 429:
+        return {
+            "kind": "retry",
+            "rate_limited": True,
+            "error": "HTTP 429 Rate Limited (web_create_ajax/attempt)",
+        }
+
+    if status_code >= 500:
+        return {
+            "kind": "retry",
+            "rate_limited": False,
+            "error": f"HTTP {status_code} (attempt server)",
+        }
+
+    if _is_login_wall(response, body):
+        return {
+            "kind": "fallback",
+            "error": "Login/challenge (attempt API)",
+        }
+
+    if payload is None:
+        return {
+            "kind": "fallback",
+            "error": f"Attempt JSON emas (HTTP {status_code})",
+        }
+
+    if _has_username_taken_signal(payload, body):
+        return {"kind": "ok", "status": CheckStatus.TAKEN}
+
+    errors = payload.get("errors") if isinstance(payload.get("errors"), dict) else {}
+    has_username_error = bool(errors.get("username")) if isinstance(errors, dict) else False
+    status_ok = str(payload.get("status") or "").lower() == "ok"
+
+    if status_ok and not has_username_error:
+        return {"kind": "ok", "status": CheckStatus.AVAILABLE}
+
+    if status_code == 200 and not has_username_error and payload.get("username_is_taken") is False:
+        return {"kind": "ok", "status": CheckStatus.AVAILABLE}
+
+    msg = _json_message(payload).lower()
+    if any(token in msg for token in ("csrf", "checkpoint", "challenge", "login_required")):
+        return {
+            "kind": "fallback",
+            "error": f"Attempt CSRF/challenge: {msg[:120]}",
+        }
+
+    return {
+        "kind": "fallback",
+        "error": f"Attempt noaniq javob HTTP {status_code}",
+    }
+
+
 def _api_headers(username: str) -> dict[str, str]:
     return {
         **_COMMON_HEADERS,
@@ -347,6 +492,8 @@ def _classify_api_response(
     payload: dict[str, Any] | None,
     response: Any,
     body: str,
+    *,
+    trust_not_found: bool = True,
 ) -> dict[str, Any]:
     """
     web_profile_info javobi.
@@ -373,9 +520,19 @@ def _classify_api_response(
         }
 
     if status_code == 404:
+        if not trust_not_found:
+            return {
+                "kind": "fallback",
+                "error": "web_profile_info 404 (banned bo'lishi mumkin)",
+            }
         return {"kind": "ok", "status": CheckStatus.AVAILABLE}
 
     if payload and _is_user_not_found(payload):
+        if not trust_not_found:
+            return {
+                "kind": "fallback",
+                "error": "web_profile_info user not found (banned bo'lishi mumkin)",
+            }
         return {"kind": "ok", "status": CheckStatus.AVAILABLE}
 
     if payload:
@@ -383,6 +540,11 @@ def _classify_api_response(
         if isinstance(user, dict) and (user.get("id") or user.get("pk") or user.get("username")):
             return {"kind": "ok", "status": CheckStatus.TAKEN}
         if user is None and status_code == 200:
+            if not trust_not_found:
+                return {
+                    "kind": "fallback",
+                    "error": "web_profile_info user=null (banned bo'lishi mumkin)",
+                }
             return {"kind": "ok", "status": CheckStatus.AVAILABLE}
 
     if status_code in (400, 403):
@@ -413,6 +575,8 @@ def _classify_profile_html(
     html: str,
     username: str,
     final_url: str,
+    *,
+    taken_only: bool = False,
 ) -> dict[str, Any]:
     if status_code == 429:
         return {
@@ -438,6 +602,13 @@ def _classify_profile_html(
             "error": "HTML login redirect",
         }
 
+    if taken_only:
+        return {
+            "kind": "retry",
+            "rate_limited": False,
+            "error": "HTML da profil yo'q — AVAILABLE deb belgilanmadi (banned xavfi)",
+        }
+
     return {"kind": "ok", "status": CheckStatus.AVAILABLE}
 
 
@@ -452,7 +623,7 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | client=curl_cffi/%s | api=web_profile_info",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | client=curl_cffi/%s | api=web_create_ajax/attempt",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
             _IMPERSONATE,
@@ -460,7 +631,7 @@ class InstagramChecker:
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (web_profile_info, curl_cffi) | proxy=%s",
+            "InstagramChecker ishga tushdi (registration attempt, curl_cffi) | proxy=%s",
             bool(self._base_proxy),
         )
 
@@ -620,13 +791,95 @@ class InstagramChecker:
         proxy: str | None,
     ) -> dict[str, Any]:
         """
-        Bitta yangi proxy sessiya: avval web_profile_info, kerak bo'lsa HTML fallback.
+        Bitta yangi proxy sessiya:
+        1) signup GET (CSRF) + web_create_ajax/attempt POST
+        2) CSRF/challenge -> web_profile_info (faqat TAKEN ishonchli)
+        3) HTML profil GET (faqat aniq profil metategi = TAKEN)
         """
         kwargs = self._session_kwargs(proxy)
         api_url = _WEB_PROFILE_INFO_URL.format(username=quote(username, safe="._"))
         profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
+        form_data = {
+            "email": f"chk_{username[:6]}@gmail.com",
+            "username": username,
+            "first_name": "Test",
+            "opt_into_one_tap": "false",
+        }
 
         async with AsyncSession(**kwargs) as session:
+            signup_resp = await session.get(
+                _SIGNUP_URL,
+                headers=_PROFILE_HEADERS,
+                timeout=_REQUEST_TIMEOUT,
+                allow_redirects=True,
+                verify=False,
+            )
+
+            if _is_wrong_origin(signup_resp):
+                return {
+                    "kind": "retry",
+                    "rate_limited": False,
+                    "error": "Proxy noto'g'ri origin (signup GET)",
+                }
+
+            signup_status = int(getattr(signup_resp, "status_code", 0) or 0)
+            if signup_status == 429:
+                return {
+                    "kind": "retry",
+                    "rate_limited": True,
+                    "error": "HTTP 429 Rate Limited (signup GET)",
+                }
+
+            csrf = _extract_csrftoken(signup_resp, session) or ""
+            attempt_resp = await session.post(
+                _ATTEMPT_URL,
+                data=form_data,
+                headers=_attempt_headers(csrf),
+                timeout=_REQUEST_TIMEOUT,
+                allow_redirects=True,
+                verify=False,
+            )
+
+            if int(getattr(attempt_resp, "status_code", 0) or 0) == 429:
+                return {
+                    "kind": "retry",
+                    "rate_limited": True,
+                    "error": "HTTP 429 Rate Limited (web_create_ajax/attempt)",
+                }
+
+            if _is_wrong_origin(attempt_resp):
+                return {
+                    "kind": "retry",
+                    "rate_limited": False,
+                    "error": "Proxy noto'g'ri origin (attempt POST)",
+                }
+
+            attempt_status = int(getattr(attempt_resp, "status_code", 0) or 0)
+            attempt_body = _html_text(attempt_resp)
+            attempt_json = _parse_json_body(attempt_resp)
+            logger.debug(
+                "[@%s] attempt POST -> HTTP %d json=%s csrf=%s",
+                username,
+                attempt_status,
+                bool(attempt_json),
+                "ha" if csrf else "yo'q",
+            )
+
+            classified = _classify_attempt_response(
+                attempt_status, attempt_json, attempt_resp, attempt_body
+            )
+            if classified["kind"] == "ok":
+                classified["source"] = "web_create_ajax/attempt"
+                return classified
+            if classified["kind"] == "retry":
+                return classified
+
+            logger.info(
+                "[@%s] Attempt fallback | %s",
+                username,
+                classified.get("error"),
+            )
+
             api_resp = await session.get(
                 api_url,
                 headers=_api_headers(username),
@@ -635,36 +888,22 @@ class InstagramChecker:
                 verify=False,
             )
 
-            if _is_wrong_origin(api_resp):
-                return {
-                    "kind": "retry",
-                    "rate_limited": False,
-                    "error": "Proxy noto'g'ri origin (Google/boshqa host) qaytardi",
-                }
-
-            status_code = int(getattr(api_resp, "status_code", 0) or 0)
-            body = _html_text(api_resp)
-            payload = _parse_json_body(api_resp)
-            logger.debug(
-                "[@%s] API GET -> HTTP %d json=%s body=%dB",
-                username,
-                status_code,
-                bool(payload),
-                len(body),
-            )
-
-            classified = _classify_api_response(status_code, payload, api_resp, body)
-            if classified["kind"] == "ok":
-                classified["source"] = "web_profile_info"
-                return classified
-            if classified["kind"] == "retry":
-                return classified
-
-            logger.info(
-                "[@%s] API fallback HTML | %s",
-                username,
-                classified.get("error"),
-            )
+            if not _is_wrong_origin(api_resp):
+                api_status = int(getattr(api_resp, "status_code", 0) or 0)
+                api_body = _html_text(api_resp)
+                api_json = _parse_json_body(api_resp)
+                api_classified = _classify_api_response(
+                    api_status,
+                    api_json,
+                    api_resp,
+                    api_body,
+                    trust_not_found=False,
+                )
+                if api_classified["kind"] == "ok":
+                    api_classified["source"] = "web_profile_info"
+                    return api_classified
+                if api_classified["kind"] == "retry":
+                    return api_classified
 
             html_resp = await session.get(
                 profile_url,
@@ -684,7 +923,9 @@ class InstagramChecker:
         html_status = int(getattr(html_resp, "status_code", 0) or 0)
         html = _html_text(html_resp)
         final_url = str(getattr(html_resp, "url", "") or "")
-        html_result = _classify_profile_html(html_status, html, username, final_url)
+        html_result = _classify_profile_html(
+            html_status, html, username, final_url, taken_only=True
+        )
         if html_result["kind"] == "ok":
             html_result["source"] = "html_fallback"
         return html_result
