@@ -33,7 +33,7 @@ from models.username_log import CheckStatus
 logger = logging.getLogger(__name__)
 
 _OEMBED_URL = "https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/{username}/"
-_REGISTRATION_CHECK_URL = "https://i.instagram.com/api/v1/accounts/check_username/"
+_REGISTRATION_CHECK_URL = "https://i.instagram.com/api/v1/users/check_username/"
 
 _REQUEST_TIMEOUT = 6.0
 _IMPERSONATE = "chrome124"
