@@ -1,8 +1,7 @@
 """Instagram username tekshirish servisi.
 
-The native Android endpoint is the only primary source. Any ambiguous result
-is deliberately treated as TAKEN so transient Instagram responses cannot
-produce a false AVAILABLE result.
+oEmbed identifies active accounts; the CSRF-backed signup validation handles
+the remaining 404 case, including banned and deactivated usernames.
 """
 from __future__ import annotations
 
@@ -39,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 _SIGNUP_PAGE_URL = "https://www.instagram.com/accounts/emailsignup/"
 _SIGNUP_ATTEMPT_URL = "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
-_PROFILE_URL = "https://www.instagram.com/{username}/"
+_OEMBED_URL = "https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/{username}/"
 
 _REQUEST_TIMEOUT = 20.0
 _IMPERSONATE = "chrome120"
@@ -64,10 +63,9 @@ _SIGNUP_HEADERS: dict[str, str] = {
     "Referer": _SIGNUP_PAGE_URL,
 }
 
-_PROFILE_HEADERS: dict[str, str] = {
+_OEMBED_HEADERS: dict[str, str] = {
     "User-Agent": _SIGNUP_USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "application/json",
 }
 
 _NETWORK_EXCEPTIONS = (
@@ -159,12 +157,6 @@ def _parse_json_body(response: Any) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
-def _is_timeout_exception(exc: BaseException) -> bool:
-    return isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or (
-        "timeout" in type(exc).__name__.lower()
-    )
-
-
 def _has_username_error(payload: dict[str, Any]) -> bool:
     errors = payload.get("errors")
     if isinstance(errors, dict):
@@ -180,10 +172,6 @@ def _has_username_error(payload: dict[str, Any]) -> bool:
     return False
 
 
-def _looks_like_regular_word(username: str) -> bool:
-    return username.isalpha() and len(username) >= 4
-
-
 class InstagramChecker:
     """Instagram username mavjudligini native Android endpoint orqali tekshiradi."""
 
@@ -193,14 +181,14 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=signup",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=oembed+signup",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
         )
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (CSRF signup) | proxy=%s",
+            "InstagramChecker ishga tushdi (oEmbed + CSRF signup) | proxy=%s",
             bool(self._base_proxy),
         )
 
@@ -332,78 +320,62 @@ class InstagramChecker:
                     },
                 )
             except _NETWORK_EXCEPTIONS as exc:
-                error_kind = "timeout" if _is_timeout_exception(exc) else "network"
-                return {"kind": "fallback", "error": f"signup {error_kind}: {exc}"}
+                return {
+                    "kind": "ok",
+                    "status": CheckStatus.TAKEN,
+                    "source": "safe_taken",
+                    "error": f"signup network error: {exc}",
+                }
 
             status_code = int(getattr(resp, "status_code", 0) or 0)
             if status_code == 429:
-                return {"kind": "fallback", "error": "signup HTTP 429"}
+                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_taken"}
 
             payload = _parse_json_body(resp)
             if not payload:
-                return {"kind": "fallback", "error": "signup response is not JSON"}
+                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_taken"}
             if _has_username_error(payload):
-                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "signup_taken"}
+                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "signup_taken_banned"}
             if payload.get("status") == "ok":
                 return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "signup_available"}
-            return {"kind": "fallback", "error": "signup response is ambiguous"}
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_taken"}
 
-    async def _try_profile(
+    async def _try_oembed(
         self,
         session: AsyncSession,
         username: str,
     ) -> dict[str, Any]:
-        profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
+        oembed_url = _OEMBED_URL.format(username=quote(username, safe="._"))
         try:
-            resp = await self._request(session, "GET", profile_url, _PROFILE_HEADERS)
+            resp = await self._request(session, "GET", oembed_url, _OEMBED_HEADERS)
         except _NETWORK_EXCEPTIONS as exc:
             return {
                 "kind": "ok",
                 "status": CheckStatus.TAKEN,
-                "source": "profile_deactive",
-                "error": f"profile network error: {exc}",
+                "source": "safe_taken",
+                "error": f"oEmbed network error: {exc}",
             }
 
         status_code = int(getattr(resp, "status_code", 0) or 0)
-        html = _body_text(resp)
-        html_lower = html.lower()
-        final_url = str(getattr(resp, "url", "") or "").lower()
-
-        if (
-            "- followers, " in html_lower
-            or f"(@{username.lower()})" in html_lower
-            or "edge_followed_by" in html_lower
-        ):
-            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_active"}
-
-        if "/accounts/login" in final_url or "/challenge" in final_url:
-            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_deactive"}
-
-        if (
-            status_code == 404
-            or "<title>page not found" in html_lower
-            or "sorry, this page isn't available." in html_lower
-        ):
-            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_available"}
-
-        if "<title>instagram</title>" in html_lower:
-            if _looks_like_regular_word(username):
-                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_deactive"}
-            return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_available"}
-
-        if _looks_like_regular_word(username):
-            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "profile_deactive"}
-
-        return {"kind": "ok", "status": CheckStatus.AVAILABLE, "source": "profile_available"}
+        if status_code == 200:
+            payload = _parse_json_body(resp)
+            if payload and ("author_name" in payload or "author_id" in payload):
+                return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "oembed_active"}
+            return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_taken"}
+        if status_code == 404:
+            return {"kind": "signup_required", "error": "oEmbed profile not found"}
+        return {"kind": "ok", "status": CheckStatus.TAKEN, "source": "safe_taken"}
 
     async def _funnel_check(self, username: str, proxy: str | None) -> dict[str, Any]:
-        signup = await self._check_signup_availability(username, proxy)
-        if signup["kind"] == "ok":
-            return signup
-
         kwargs = self._session_kwargs(proxy)
         async with AsyncSession(**kwargs) as session:
-            return await self._try_profile(session, username)
+            oembed = await self._try_oembed(session, username)
+            if oembed["kind"] == "ok":
+                return oembed
+            if oembed["kind"] != "signup_required":
+                return oembed
+
+        return await self._check_signup_availability(username, proxy)
 
 
 instagram_checker = InstagramChecker()
