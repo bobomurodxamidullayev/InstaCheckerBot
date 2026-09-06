@@ -199,49 +199,27 @@ class InstagramChecker:
             logger.warning("[@%s] Parallel tekshiruv — davom etiladi.", username_clean)
 
         self._checking_usernames.add(username_clean)
-        max_attempts = 1 + (2 if max_retries >= 1 else 0)
         attempts = 0
         try:
             await asyncio.sleep(
                 random.uniform(settings.check_delay_min, settings.check_delay_max)
             )
-            for attempt in range(1, max_attempts + 1):
-                attempts = attempt
-                sticky_proxy = (
-                    _make_session_proxy(self._base_proxy)
-                    if attempt < max_attempts else None
-                )
-                result = await self._funnel_check(username_clean, sticky_proxy)
-                if result.get("kind") == "ok":
-                    status: CheckStatus = result["status"]
-                    source = result.get("source", "unknown")
-                    logger.info("[@%s] %s (%s)", username_clean, status.value, source)
-                    return CheckResult(
-                        username=username_clean,
-                        status=status,
-                        attempts=attempt,
-                    )
-                if result.get("retries_exhausted"):
-                    break
-                if result.get("retryable"):
-                    retry_after = min(float(result.get("retry_after", 1.0)), 30.0)
-                    logger.warning(
-                        "[@%s] rate limit; retrying in %.1fs | urinish %d/%d",
-                        username_clean,
-                        retry_after,
-                        attempt,
-                        max_attempts,
-                    )
-                    await asyncio.sleep(retry_after)
-                    continue
-                logger.warning(
-                    "[@%s] tarmoq/proxy xato (%s) | urinish %d",
-                    username_clean,
-                    result.get("error"),
-                    attempt,
+            attempts = 1
+            result = await self._funnel_check(
+                username_clean,
+                _make_session_proxy(self._base_proxy),
+            )
+            if result.get("kind") == "ok":
+                status: CheckStatus = result["status"]
+                source = result.get("source", "unknown")
+                logger.info("[@%s] %s (%s)", username_clean, status.value, source)
+                return CheckResult(
+                    username=username_clean,
+                    status=status,
+                    attempts=attempts,
                 )
             last_error = result.get("error", "network or verification failure")
-            logger.warning("[@%s] verification failed after retries -> ERROR", username_clean)
+            logger.warning("[@%s] verification failed -> ERROR", username_clean)
             return CheckResult(
                 username=username_clean,
                 status=CheckStatus.ERROR,
@@ -327,15 +305,8 @@ class InstagramChecker:
         raw_text = _body_text(response)
         status_code = int(getattr(response, "status_code", 0) or 0)
         if status_code == 429:
-            retry_after_header = getattr(response, "headers", {}).get("Retry-After")
-            try:
-                retry_after = max(float(retry_after_header), settings.rate_limit_sleep)
-            except (TypeError, ValueError):
-                retry_after = settings.rate_limit_sleep
             return {
                 "kind": "error",
-                "retryable": True,
-                "retry_after": retry_after,
                 "error": "registration check rate-limited (HTTP 429)",
             }
         payload = _parse_json_body(response)
