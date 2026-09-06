@@ -805,22 +805,22 @@ class InstagramChecker:
             prior_resp = profile_result.get("response")
             classified = await self._signup_attempt_in_session(session, username, prior_resp)
 
-            # 429 -> yangi IP bilan bir marta qayta urinish
+            # 429 -> sticky IP bilan bitta qayta urinish
             if classified.get("rate_limited"):
                 logger.warning(
-                    "[@%s] signup attempt HTTP 429 | yangi proxy IP, qayta urinish",
+                    "[@%s] signup attempt HTTP 429 | sticky IP bilan qayta urinish",
                     username,
                 )
-                return await self._signup_attempt_fresh(username, self._get_session_proxy())
+                classified = await self._signup_attempt_fresh(username, self._get_session_proxy())
 
-            # Fallback: signup attempt ham muvaffaqiyatsiz + profil aniq 404 -> AVAILABLE
+            # Fallback: signup attempt retry/429 + profil aniq 404 -> AVAILABLE (ERROR emas)
             if classified["kind"] == "retry":
                 html = profile_result.get("html", "")
                 html_status = profile_result.get("html_status", 0)
                 final_url = profile_result.get("final_url", "")
                 if _html_is_page_not_found(html, html_status, final_url):
                     logger.info(
-                        "[@%s] Fallback: signup API xato + profil 404 -> AVAILABLE",
+                        "[@%s] Fallback: signup API 429/xato + profil 404 -> AVAILABLE",
                         username,
                     )
                     return {
@@ -828,20 +828,39 @@ class InstagramChecker:
                         "status": CheckStatus.AVAILABLE,
                         "source": "fallback_404",
                     }
+                # Profil 404 emas (login redirect yoki boshqa) — retry davom etsin
+                logger.warning(
+                    "[@%s] signup attempt retry, profil 404 emas — keyingi urinish",
+                    username,
+                )
 
             return classified
 
-        # kind=skip — profil GET o'tkazildi, yangi IP bilan signup attempt
-        logger.info("[@%s] profil GET o'tkazildi, yangi IP bilan signup attempt", username)
-        return await self._signup_attempt_fresh(username, self._get_session_proxy())
+        # kind=skip — profil GET timeout/429/SSL, sticky IP bilan signup attempt
+        logger.info("[@%s] profil GET o'tkazildi, sticky IP bilan signup attempt", username)
+        fresh = await self._signup_attempt_fresh(username, self._get_session_proxy())
+        # Fresh attempt ham 429/retry bersa — retry qaytaramiz, loop yangi IP bilan qayta bajaradi
+        return fresh
 
     async def _signup_attempt_fresh(
         self,
         username: str,
         proxy: str | None,
     ) -> dict[str, Any]:
-        """Yangi sessiya/IP bilan faqat signup attempt POST."""
-        kwargs = self._session_kwargs(proxy)
+        """
+        Sticky sessiya bilan emailsignup GET + attempt POST.
+
+        DataImpulse rotating proxy muammosi:
+        GET va POST ayri sessiyalarda turli IP dan ketsa, Instagram
+        cookie/IP nomuvofiqligini sezib 429 beradi.
+
+        Bu metod _make_session_proxy() orqali bitta sessiya ID (sticky IP)
+        yaratadi va o'sha bitta AsyncSession ichida ikkala so'rovni bajaradi.
+        """
+        # Sticky: agar base_proxy mavjud bo'lsa, session ID ni bu yerda bir marta
+        # belgilab, _session_kwargs ga tayyor proxy beramiz.
+        sticky_proxy = _make_session_proxy(self._base_proxy) if self._base_proxy else proxy
+        kwargs = self._session_kwargs(sticky_proxy)
         async with AsyncSession(**kwargs) as session:
             return await self._signup_attempt_in_session(session, username, None)
 
