@@ -113,17 +113,6 @@ _TAKEN_BODY_MARKERS: tuple[str, ...] = (
     "og:description",
 )
 
-# The ONLY substrings that count as an explicit "this handle was never
-# registered" signal. A couple of HTML-entity variants of the apostrophe are
-# included so encoding differences don't silently defeat the match — but the
-# core two strings are exactly the ones Instagram serves.
-_NOT_FOUND_MARKERS: tuple[str, ...] = (
-    "Page Not Found",
-    "Sorry, this page isn't available",
-    "Sorry, this page isn&#039;t available",
-    "Sorry, this page isn\u2019t available",
-)
-
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -222,20 +211,25 @@ class InstagramChecker:
     Tier 2 — oEmbed GET               (faol ochiq profilni tezkor aniqlash)
     Tier 3 — Pure HTML inspection GET (yakuniy, deterministik qaror)
 
-    Tier 3 to'rt bosqichli qat'iy qoida bilan ishlaydi:
+    Tier 3 SPA-aware qat'iy qoida bilan ishlaydi:
       • TAKEN   — (a) login/challenge/checkpoint redirect, YOKI (b) tanada
-                  haqiqiy egalik belgisi bor: owner_user_id, profile_pic_url,
-                  biography, Followers/og:description meta, yoki profilning
-                  "instagram://user?username=..." deep-link'i. Umumiy React
-                  runtime kalitlari (masalan har bir sahifada — hatto 404'da
-                  ham — uchraydigan "userID":"0"/null) signal sifatida
-                  ISHLATILMAYDI. (c) status 200 va yuqoridagi ikkalasi ham
-                  yo'q, LEKIN aniq "not found" matni ham yo'q — bu
-                  bloklangan/deaktivatsiya qilingan/band akkaunt uchun
-                  "ghost shell" hisoblanadi (masalan apex.uz).
-      • AVAILABLE — FAQAT aniq 404 status yoki "Page Not Found"/"Sorry, this
-                  page isn't available" matni topilganda beriladi — boshqa
-                  hech qanday holatda emas.
+                  aniq profil belgisi bor: owner_user_id, profile_pic_url,
+                  biography, Followers/og:description meta, profilning
+                  "instagram://user?username=..." deep-link'i, YOKI username
+                  o'zi qo'shtirnoqda + real user-object kaliti ("id":,
+                  "has_blocked_viewer", "is_verified") bilan birga uchrasa —
+                  bu OG teglari yashirilgan, lekin SPA bootstrap holatida
+                  minimal user record qolgan bloklangan/band akkauntlarni
+                  ushlaydi. Umumiy React runtime kalitlari (masalan har bir
+                  sahifada uchraydigan "userID":"0"/null) signal sifatida
+                  ISHLATILMAYDI.
+      • AVAILABLE — yuqoridagi TAKEN belgilarining birortasi ham topilmasa.
+                  Instagram bu SPA'da har doim HTTP 200 va umumiy,
+                  username'ga bog'liq bo'lmagan app-shell qaytaradi — na
+                  band, na haqiqatan bo'sh username uchun ishonchli aniq
+                  "not found" matni kafolatlanmaydi, shuning uchun yuqoridagi
+                  aniq belgilarning yo'qligi endi yetarli va yagona
+                  AVAILABLE signali hisoblanadi.
       • ERROR faqat tarmoq/transport darajasidagi tiklab bo'lmaydigan
         xatolarda qaytariladi.
     """
@@ -533,19 +527,23 @@ class InstagramChecker:
         html: str,
     ) -> dict[str, Any]:
         """
-        Deterministic four-branch rule:
+        Deterministic SPA-aware rule:
           1. Redirect/gate URL → TAKEN.
-          2. Real ownership marker (or the profile's deep-link) in the body
-             → TAKEN.
-          3. Explicit not-found signal (404 status, or "Page Not Found" /
-             "Sorry, this page isn't available" copy) → AVAILABLE. This is
-             the ONLY route to AVAILABLE.
-          4. A silent/ghost 200 shell — status 200, no ownership marker, and
-             no explicit not-found copy — → TAKEN. Instagram serves exactly
-             this shape for deactivated, banned, or on-hold handles (e.g.
-             apex.uz, mantafli's neighbours); a truly free handle always
-             carries the explicit not-found signal from step 3, never a bare
-             200 shell.
+          2. A definite profile marker → TAKEN:
+               - any `_TAKEN_BODY_MARKERS` hit, OR
+               - the profile's iOS deep-link, OR
+               - the username itself appears quoted in the payload
+                 alongside a real user-object key ("id":,
+                 "has_blocked_viewer", or "is_verified") — this catches
+                 accounts (including banned/held ones) whose OpenGraph
+                 tags are suppressed but whose SPA bootstrap state still
+                 embeds a minimal user record for that exact username.
+          3. Anything else → AVAILABLE. Instagram's SPA returns HTTP 200
+             with a generic, username-agnostic app shell both for a plain
+             404 and for a genuinely unclaimed handle, and does not
+             reliably include literal not-found copy in the raw SSR
+             payload — so the absence of every marker above is now the
+             sole and sufficient signal for availability.
         """
         # ---- 1. Redirect / gate URL ----
         if any(marker in response_url for marker in _TAKEN_URL_MARKERS):
@@ -557,12 +555,24 @@ class InstagramChecker:
                 "reason": "login_or_checkpoint_redirect",
             }
 
-        # ---- 2. Real ownership markers in the body ----
+        # ---- 2. Definite profile markers ----
         deep_link_marker = f"instagram://user?username={username.lower()}"
         ownership_markers = (*_TAKEN_BODY_MARKERS, deep_link_marker)
         hit = next((m for m in ownership_markers if m in html), None)
-        if hit is not None:
-            logger.info("[@%s] html → TAKEN (ownership_marker=%r)", username, hit)
+
+        username_lower = username.lower()
+        quoted_username_hit = (
+            f'"{username_lower}"' in html.lower()
+            and (
+                '"id":' in html
+                or '"has_blocked_viewer"' in html
+                or '"is_verified"' in html
+            )
+        )
+
+        if hit is not None or quoted_username_hit:
+            marker_detail = hit if hit is not None else "quoted_username+user_object_key"
+            logger.info("[@%s] html → TAKEN (marker=%r)", username, marker_detail)
             return {
                 "kind": "ok",
                 "status": CheckStatus.TAKEN,
@@ -570,31 +580,16 @@ class InstagramChecker:
                 "reason": "profile_active_private_or_banned",
             }
 
-        # ---- 3. Explicit not-found signal — the ONLY route to AVAILABLE ----
-        not_found_hit = next((m for m in _NOT_FOUND_MARKERS if m in html), None)
-        if status_code == 404 or not_found_hit is not None:
-            logger.info(
-                "[@%s] html → AVAILABLE (status=%d, not_found_marker=%r)",
-                username, status_code, not_found_hit,
-            )
-            return {
-                "kind": "ok",
-                "status": CheckStatus.AVAILABLE,
-                "source": "html_not_found",
-                "reason": "truly_available",
-            }
-
-        # ---- 4. Silent / ghost 200 shell → treat as taken ----
+        # ---- 3. No definite profile marker anywhere → available ----
         logger.info(
-            "[@%s] html → TAKEN (ghost_200_shell, status=%d, no ownership "
-            "marker, no not-found copy)",
+            "[@%s] html → AVAILABLE (status=%d, no definite profile marker)",
             username, status_code,
         )
         return {
             "kind": "ok",
-            "status": CheckStatus.TAKEN,
-            "source": "html_ghost_shell",
-            "reason": "banned_or_deactivated",
+            "status": CheckStatus.AVAILABLE,
+            "source": "html_no_profile_marker",
+            "reason": "truly_available",
         }
 
     # ------------------------------------------------------------------
