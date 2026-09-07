@@ -1,4 +1,4 @@
-"""Instagram username tekshirish servisi — 3-tier pipeline (web_profile_info API)."""
+"""Instagram username tekshirish servisi — 3-tier pipeline (pure HTML pipeline, no web_profile_info)."""
 from __future__ import annotations
 
 import asyncio
@@ -38,18 +38,10 @@ logger = logging.getLogger(__name__)
 
 _OEMBED_ENDPOINT = "https://www.instagram.com/api/v1/oembed/?url="
 _PROFILE_URL = "https://www.instagram.com/{username}/"
-_PROFILE_INFO_URL = (
-    "https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
-)
-
-# Instagram's official web app ID — required by the profile-info endpoint.
-# This is the public app ID embedded in every instagram.com page load.
-_IG_APP_ID = "936619743392459"
 
 _REQUEST_TIMEOUT = 6.0
 _PROFILE_TIMEOUT = 9.0
 _DIRECT_PROFILE_TIMEOUT = 7.0
-_PROFILE_INFO_TIMEOUT = 10.0
 _IMPERSONATE = "chrome124"
 _CHROME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -93,6 +85,47 @@ _RESERVED_NAMES: frozenset[str] = frozenset({
     "admin", "instagram", "support", "help", "login", "signup",
     "accounts", "explore", "direct", "security", "about", "developer",
 })
+
+# ---------------------------------------------------------------------------
+# Tier-3 HTML signal constants
+# ---------------------------------------------------------------------------
+
+# Substrings in the final redirected URL that mean the handle is gated/taken
+# (login wall, checkpoint, age/consent challenge) rather than free.
+_TAKEN_URL_MARKERS: tuple[str, ...] = (
+    "/accounts/login",
+    "/challenge",
+    "checkpoint",
+    "/accounts/suspended",
+)
+
+# Substrings in the HTML body that only appear when Instagram has rendered
+# (or attempted to render) an actual profile — active, private, banned,
+# deactivated, or checkpointed accounts all leave at least one of these.
+_TAKEN_BODY_MARKERS: tuple[str, ...] = (
+    "instapp:owner_user_id",
+    "profile_pic_url",
+    "edge_followed_by",
+    "graphql\":{\"user",
+    "\"userID\"",
+    "\"user_id\"",
+    "PolarisProfilePostsQuery",
+    "ProfilePageContainer",
+    "\"is_private\"",
+    "\"full_name\"",
+    "\"biography\"",
+    "checkpoint_required",
+    "Followers",
+    "Following",
+)
+
+# Substrings that unambiguously mean Instagram never had a profile to serve.
+_AVAILABLE_BODY_MARKERS: tuple[str, ...] = (
+    "Page Not Found",
+    "Sorry, this page isn't available.",
+    "Sorry, this page isn&#039;t available.",
+    "the link you followed may be broken",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +221,24 @@ class InstagramChecker:
     """
     Instagram username mavjudligini 3-bosqichli pipeline orqali tekshiradi.
 
-    Tier 1  — Pre-validation regex       (so'rovsiz lahzali rad etish)
-    Tier 2  — oEmbed GET                 (faol profilni tezkor aniqlash)
-    Tier 3  — web_profile_info API GET   (aniq mavjudlik tekshiruvi, 429 yo'q)
+    Tier 1 — Pre-validation regex     (so'rovsiz lahzali rad etish)
+    Tier 2 — oEmbed GET               (faol ochiq profilni tezkor aniqlash)
+    Tier 3 — Pure HTML inspection GET (yakuniy, deterministik qaror)
+
+    Tier 3 qat'iy qoida bilan ishlaydi:
+      • TAKEN   — login/challenge/checkpoint redirect, yoki tanadagi istalgan
+                  profil-mavjudlik belgisi (owner id, follower/following
+                  meta, react/polaris kalitlari) topilsa — "not found" matni
+                  bo'lmagan holatda.
+      • AVAILABLE — faqat aniq 404, "Page Not Found" yoki "Sorry, this page
+                  isn't available." matni topilganda.
+      • Aks holda (bo'sh/noaniq javob) — xavfsiz tomonga: TAKEN. Instagram
+        haqiqatan bo'sh username uchun har doim aniq 404/not-found matni
+        qaytaradi; belgisiz bo'sh HTML deyarli har doim bloklangan/cheklangan
+        akkauntni bildiradi, shuning uchun bu holat hech qachon "indeterminate"
+        sifatida qaytarilmaydi.
+      • ERROR faqat tarmoq/transport darajasidagi tiklab bo'lmaydigan
+        xatolarda qaytariladi.
     """
 
     def __init__(self, proxy_url: str | None = None) -> None:
@@ -199,14 +247,14 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=web_profile_info",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=html_only",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
         )
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (web_profile_info pipeline) | proxy=%s",
+            "InstagramChecker ishga tushdi (pure-HTML pipeline) | proxy=%s",
             bool(self._base_proxy),
         )
 
@@ -367,8 +415,11 @@ class InstagramChecker:
         username: str,
     ) -> dict[str, Any]:
         """
-        Returns kind="ok" (TAKEN) when oEmbed confirms an active account.
-        Returns kind="check_required" to fall through to web_profile_info.
+        Returns kind="ok" (TAKEN) when oEmbed confirms an active public account.
+        Returns kind="check_required" to fall through to the HTML tier —
+        oEmbed only ever confirms positives, it never proves availability
+        (private, banned, deactivated, and checkpointed accounts all fail
+        oEmbed too, same as a truly free handle).
         """
         profile_url = f"https://www.instagram.com/{username}/"
         oembed_url = f"{_OEMBED_ENDPOINT}{quote_plus(profile_url)}"
@@ -396,165 +447,24 @@ class InstagramChecker:
             }
         return {
             "kind": "check_required",
-            "error": f"oEmbed status {status_code}; falling through to profile_info",
+            "error": f"oEmbed status {status_code}; falling through to html",
         }
 
     # ------------------------------------------------------------------
-    # TIER 3 — web_profile_info API GET (definitive gate)
+    # TIER 3 — Pure HTML inspection (definitive, deterministic gate)
     # ------------------------------------------------------------------
 
-    async def _try_profile_info(
+    async def _try_html(
         self,
         session: AsyncSession,
         username: str,
         proxy: str | None,
     ) -> dict[str, Any]:
         """
-        Queries Instagram's internal web_profile_info endpoint with the official
-        app ID header. This GET-only API never triggers 429 and correctly
-        identifies banned, deactivated, and 14-day-hold handles.
-
-        HTTP 200 + data.user != null → TAKEN (active account)
-        HTTP 404 + user/checkpoint/require_login in body → TAKEN (banned/deactivated)
-        HTTP 404 + "Not Found" / status:fail without user → AVAILABLE (truly free)
-        Any other / network fail → HTML fallback
-        """
-        api_url = _PROFILE_INFO_URL.format(username=quote(username, safe="._"))
-        api_headers: dict[str, str] = {
-            "User-Agent": _CHROME_USER_AGENT,
-            "X-IG-App-ID": _IG_APP_ID,
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": f"https://www.instagram.com/{username}/",
-        }
-
-        response = None
-        try:
-            response = await self._request(
-                session,
-                "GET",
-                api_url,
-                api_headers,
-                timeout=_PROFILE_INFO_TIMEOUT,
-            )
-        except _NETWORK_EXCEPTIONS as proxy_error:
-            # Proxy failed — retry once with direct connection
-            if proxy:
-                try:
-                    async with AsyncSession(
-                        **self._session_kwargs(None, _PROFILE_INFO_TIMEOUT)
-                    ) as direct_session:
-                        response = await self._request(
-                            direct_session,
-                            "GET",
-                            api_url,
-                            api_headers,
-                            timeout=_PROFILE_INFO_TIMEOUT,
-                        )
-                except _NETWORK_EXCEPTIONS as direct_error:
-                    logger.warning(
-                        "[@%s] profile_info proxy+direct failed: %s — HTML fallback",
-                        username, direct_error,
-                    )
-                    return await self._html_fallback(session, username, proxy)
-            else:
-                logger.warning(
-                    "[@%s] profile_info network error: %s — HTML fallback",
-                    username, proxy_error,
-                )
-                return await self._html_fallback(session, username, proxy)
-
-        status_code = int(getattr(response, "status_code", 0) or 0)
-        body = _body_text(response)
-        data = _parse_json_body(response) or {}
-
-        logger.debug(
-            "[@%s] profile_info status=%d body_snip=%r",
-            username, status_code, body[:160],
-        )
-
-        # ------------------------------------------------------------------
-        # HTTP 200 — check whether data.user is populated
-        # ------------------------------------------------------------------
-        if status_code == 200:
-            outer = data.get("data", {})
-            if isinstance(outer, dict):
-                user_obj = outer.get("user")
-                if user_obj is not None:
-                    # data.user present (even if private) → account exists
-                    logger.info("[@%s] profile_info 200 → TAKEN (profile_active)", username)
-                    return {
-                        "kind": "ok",
-                        "status": CheckStatus.TAKEN,
-                        "source": "profile_info_200",
-                        "reason": "profile_active",
-                    }
-            # 200 but data.user is null or missing — treat same as 404 logic below
-            logger.debug("[@%s] profile_info 200 but data.user null — treating as 404", username)
-            status_code = 0  # fall through to 404 branch
-
-        # ------------------------------------------------------------------
-        # HTTP 404 — distinguish banned/deactivated from truly unclaimed
-        # ------------------------------------------------------------------
-        if status_code == 404 or status_code == 0:
-            # Signals that the handle exists in Instagram's DB but is hidden
-            _exists_signals = ("user", "checkpoint", "require_login")
-            if any(sig in body for sig in _exists_signals):
-                logger.info(
-                    "[@%s] profile_info 404+signals → TAKEN (banned_or_deactivated)", username
-                )
-                return {
-                    "kind": "ok",
-                    "status": CheckStatus.TAKEN,
-                    "source": "profile_info_404_exists",
-                    "reason": "banned_or_deactivated",
-                }
-
-            # Clean not-found: "Not Found" text OR status:fail without any user object
-            _not_found_signals = ("Not Found", "\"status\": \"fail\"", "\"status\":\"fail\"")
-            if any(sig in body for sig in _not_found_signals) or not any(
-                sig in body for sig in _exists_signals
-            ):
-                logger.info(
-                    "[@%s] profile_info 404+not-found → AVAILABLE (truly_available)", username
-                )
-                return {
-                    "kind": "ok",
-                    "status": CheckStatus.AVAILABLE,
-                    "source": "profile_info_404_clean",
-                    "reason": "truly_available",
-                }
-
-        # ------------------------------------------------------------------
-        # Unexpected status (e.g. 302, 429, 500) — fall back to HTML check
-        # ------------------------------------------------------------------
-        logger.warning(
-            "[@%s] profile_info unexpected status=%d — HTML fallback", username, status_code
-        )
-        return await self._html_fallback(session, username, proxy)
-
-    # ------------------------------------------------------------------
-    # HTML fallback (used only when profile_info is indeterminate)
-    # ------------------------------------------------------------------
-
-    async def _html_fallback(
-        self,
-        session: AsyncSession,
-        username: str,
-        proxy: str | None,
-    ) -> dict[str, Any]:
-        """
-        Fallback: fetch the public profile HTML page and inspect for signals.
-
-        TAKEN when any of:
-          • Redirect to /accounts/login or URL contains checkpoint
-          • "instapp:owner_user_id" in HTML
-          • "Followers" in HTML
-
-        AVAILABLE when:
-          • "Page Not Found" in HTML or HTTP 404
-
-        ERROR when none of the above match.
+        Fetches the public profile page and applies a strict, ordered
+        decision rule. This is the final word — it never returns an
+        "indeterminate" outcome; every branch resolves to TAKEN, AVAILABLE,
+        or a transport-level ERROR.
         """
         profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
         response = None
@@ -582,20 +492,21 @@ class InstagramChecker:
                 except _NETWORK_EXCEPTIONS as direct_error:
                     return {
                         "kind": "error",
-                        "error": f"HTML fallback proxy+direct failed: {direct_error}",
+                        "error": f"HTML tier proxy+direct failed: {direct_error}",
                     }
             else:
-                return {"kind": "error", "error": f"HTML fallback network error: {exc}"}
+                return {"kind": "error", "error": f"HTML tier network error: {exc}"}
 
         if response is None:
-            return {"kind": "error", "error": "HTML fallback: no response"}
+            return {"kind": "error", "error": "HTML tier: no response object"}
 
         response_url = str(getattr(response, "url", ""))
-        sc = int(getattr(response, "status_code", 0) or 0)
+        status_code = int(getattr(response, "status_code", 0) or 0)
         html = _body_text(response)
 
-        # Checkpoint redirect via proxy — retry direct once
-        if "checkpoint" in response_url or "challenge" in response_url:
+        # A proxy-triggered checkpoint/challenge redirect is a proxy artifact,
+        # not a verdict — retry once directly before deciding anything.
+        if proxy and ("checkpoint" in response_url or "challenge" in response_url):
             try:
                 async with AsyncSession(
                     **self._session_kwargs(None, _DIRECT_PROFILE_TIMEOUT)
@@ -608,36 +519,76 @@ class InstagramChecker:
                         timeout=_DIRECT_PROFILE_TIMEOUT,
                     )
                 response_url = str(getattr(response, "url", ""))
-                sc = int(getattr(response, "status_code", 0) or 0)
+                status_code = int(getattr(response, "status_code", 0) or 0)
                 html = _body_text(response)
             except _NETWORK_EXCEPTIONS:
-                pass  # continue with what we have
+                pass  # keep the proxy-fetched response and decide with what we have
 
-        # TAKEN signals
-        if (
-            "/accounts/login" in response_url
-            or "checkpoint" in response_url
-            or "instapp:owner_user_id" in html
-            or "Followers" in html
-        ):
+        return self._classify_html(username, status_code, response_url, html)
+
+    def _classify_html(
+        self,
+        username: str,
+        status_code: int,
+        response_url: str,
+        html: str,
+    ) -> dict[str, Any]:
+        """
+        Deterministic ordered rule:
+          1. Redirect/gate URL → TAKEN.
+          2. Any profile-existence body marker → TAKEN.
+          3. Explicit not-found signal (404 status or not-found copy) → AVAILABLE.
+          4. Anything else (empty/ambiguous shell) → TAKEN (safe default —
+             Instagram only ever serves a markerless shell for gated
+             accounts; truly free handles always carry an explicit
+             not-found signal).
+        """
+        # ---- 1. Redirect / gate URL ----
+        if any(marker in response_url for marker in _TAKEN_URL_MARKERS):
+            logger.info("[@%s] html → TAKEN (redirect_gate: %s)", username, response_url)
             return {
                 "kind": "ok",
                 "status": CheckStatus.TAKEN,
-                "source": "html_fallback",
-                "reason": "profile_active_or_banned",
+                "source": "html_redirect_gate",
+                "reason": "login_or_checkpoint_redirect",
             }
 
-        # AVAILABLE signals
-        if sc == 404 or "Page Not Found" in html or "Sorry, this page isn't available" in html:
+        # ---- 2. Profile-existence markers in the body ----
+        hit = next((m for m in _TAKEN_BODY_MARKERS if m in html), None)
+        if hit is not None:
+            logger.info("[@%s] html → TAKEN (body_marker=%r)", username, hit)
+            return {
+                "kind": "ok",
+                "status": CheckStatus.TAKEN,
+                "source": "html_body_marker",
+                "reason": "profile_active_private_or_banned",
+            }
+
+        # ---- 3. Explicit not-found signal ----
+        not_found_hit = next((m for m in _AVAILABLE_BODY_MARKERS if m in html), None)
+        if status_code == 404 or not_found_hit is not None:
+            logger.info(
+                "[@%s] html → AVAILABLE (status=%d, marker=%r)",
+                username, status_code, not_found_hit,
+            )
             return {
                 "kind": "ok",
                 "status": CheckStatus.AVAILABLE,
-                "source": "html_fallback",
+                "source": "html_not_found",
                 "reason": "truly_available",
             }
 
-        # Indeterminate
-        return {"kind": "error", "error": f"html_fallback_indeterminate (status={sc})"}
+        # ---- 4. Ambiguous / empty shell — resolve conservatively ----
+        logger.info(
+            "[@%s] html → TAKEN (ambiguous_shell, status=%d, no markers either way)",
+            username, status_code,
+        )
+        return {
+            "kind": "ok",
+            "status": CheckStatus.TAKEN,
+            "source": "html_ambiguous_default",
+            "reason": "gated_or_restricted_account",
+        }
 
     # ------------------------------------------------------------------
     # Funnel: Tier 1 → Tier 2 → Tier 3
@@ -653,8 +604,8 @@ class InstagramChecker:
             if oembed["kind"] not in ("check_required",):
                 return oembed  # propagate unexpected errors
 
-            # ---- TIER 3: web_profile_info API GET (definitive) ----
-            return await self._try_profile_info(session, username, proxy)
+            # ---- TIER 3: Pure HTML inspection (definitive) ----
+            return await self._try_html(session, username, proxy)
 
 
 instagram_checker = InstagramChecker()
