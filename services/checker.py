@@ -113,6 +113,17 @@ _TAKEN_BODY_MARKERS: tuple[str, ...] = (
     "og:description",
 )
 
+# The ONLY substrings that count as an explicit "this handle was never
+# registered" signal. A couple of HTML-entity variants of the apostrophe are
+# included so encoding differences don't silently defeat the match — but the
+# core two strings are exactly the ones Instagram serves.
+_NOT_FOUND_MARKERS: tuple[str, ...] = (
+    "Page Not Found",
+    "Sorry, this page isn't available",
+    "Sorry, this page isn&#039;t available",
+    "Sorry, this page isn\u2019t available",
+)
+
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -211,17 +222,20 @@ class InstagramChecker:
     Tier 2 — oEmbed GET               (faol ochiq profilni tezkor aniqlash)
     Tier 3 — Pure HTML inspection GET (yakuniy, deterministik qaror)
 
-    Tier 3 qat'iy qoida bilan ishlaydi:
-      • TAKEN   — login/challenge/checkpoint redirect, YOKI tanada haqiqiy
-                  egalik belgisi bor: owner_user_id, profile_pic_url,
+    Tier 3 to'rt bosqichli qat'iy qoida bilan ishlaydi:
+      • TAKEN   — (a) login/challenge/checkpoint redirect, YOKI (b) tanada
+                  haqiqiy egalik belgisi bor: owner_user_id, profile_pic_url,
                   biography, Followers/og:description meta, yoki profilning
                   "instagram://user?username=..." deep-link'i. Umumiy React
                   runtime kalitlari (masalan har bir sahifada — hatto 404'da
                   ham — uchraydigan "userID":"0"/null) signal sifatida
-                  ISHLATILMAYDI, chunki ular haqiqiy mavjudlikni bildirmaydi.
-      • AVAILABLE — yuqoridagi egalik belgilarining birortasi ham topilmasa
-                  (aniq 404/"Page Not Found" bo'ladimi yoki "Instagram"
-                  standart sarlavhali toza bo'sh shell bo'ladimi — farqi yo'q).
+                  ISHLATILMAYDI. (c) status 200 va yuqoridagi ikkalasi ham
+                  yo'q, LEKIN aniq "not found" matni ham yo'q — bu
+                  bloklangan/deaktivatsiya qilingan/band akkaunt uchun
+                  "ghost shell" hisoblanadi (masalan apex.uz).
+      • AVAILABLE — FAQAT aniq 404 status yoki "Page Not Found"/"Sorry, this
+                  page isn't available" matni topilganda beriladi — boshqa
+                  hech qanday holatda emas.
       • ERROR faqat tarmoq/transport darajasidagi tiklab bo'lmaydigan
         xatolarda qaytariladi.
     """
@@ -519,15 +533,19 @@ class InstagramChecker:
         html: str,
     ) -> dict[str, Any]:
         """
-        Deterministic two-branch rule:
+        Deterministic four-branch rule:
           1. Redirect/gate URL → TAKEN.
-          2. Any REAL ownership marker in the body → TAKEN.
-          3. Otherwise → AVAILABLE. Instagram never emits owner_user_id,
-             profile_pic_url, biography, Followers/og:description meta, or
-             the profile's iOS deep-link unless a profile has actually been
-             registered for that handle — so their total absence (whether
-             the page is an explicit 404 or a clean/empty 200 shell) means
-             the handle is truly free.
+          2. Real ownership marker (or the profile's deep-link) in the body
+             → TAKEN.
+          3. Explicit not-found signal (404 status, or "Page Not Found" /
+             "Sorry, this page isn't available" copy) → AVAILABLE. This is
+             the ONLY route to AVAILABLE.
+          4. A silent/ghost 200 shell — status 200, no ownership marker, and
+             no explicit not-found copy — → TAKEN. Instagram serves exactly
+             this shape for deactivated, banned, or on-hold handles (e.g.
+             apex.uz, mantafli's neighbours); a truly free handle always
+             carries the explicit not-found signal from step 3, never a bare
+             200 shell.
         """
         # ---- 1. Redirect / gate URL ----
         if any(marker in response_url for marker in _TAKEN_URL_MARKERS):
@@ -552,16 +570,31 @@ class InstagramChecker:
                 "reason": "profile_active_private_or_banned",
             }
 
-        # ---- 3. No ownership marker present → truly available ----
+        # ---- 3. Explicit not-found signal — the ONLY route to AVAILABLE ----
+        not_found_hit = next((m for m in _NOT_FOUND_MARKERS if m in html), None)
+        if status_code == 404 or not_found_hit is not None:
+            logger.info(
+                "[@%s] html → AVAILABLE (status=%d, not_found_marker=%r)",
+                username, status_code, not_found_hit,
+            )
+            return {
+                "kind": "ok",
+                "status": CheckStatus.AVAILABLE,
+                "source": "html_not_found",
+                "reason": "truly_available",
+            }
+
+        # ---- 4. Silent / ghost 200 shell → treat as taken ----
         logger.info(
-            "[@%s] html → AVAILABLE (status=%d, no ownership markers)",
+            "[@%s] html → TAKEN (ghost_200_shell, status=%d, no ownership "
+            "marker, no not-found copy)",
             username, status_code,
         )
         return {
             "kind": "ok",
-            "status": CheckStatus.AVAILABLE,
-            "source": "html_no_ownership_marker",
-            "reason": "truly_available",
+            "status": CheckStatus.TAKEN,
+            "source": "html_ghost_shell",
+            "reason": "banned_or_deactivated",
         }
 
     # ------------------------------------------------------------------
