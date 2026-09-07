@@ -99,32 +99,18 @@ _TAKEN_URL_MARKERS: tuple[str, ...] = (
     "/accounts/suspended",
 )
 
-# Substrings in the HTML body that only appear when Instagram has rendered
-# (or attempted to render) an actual profile — active, private, banned,
-# deactivated, or checkpointed accounts all leave at least one of these.
+# Substrings in the HTML body that ONLY appear when Instagram has actually
+# rendered a real, registered profile (owner id, profile picture, bio,
+# follower meta, or the profile's iOS deep-link). Deliberately narrow:
+# generic React-runtime scaffolding like "userID":"0"/"userID":null is
+# present on EVERY page — including 404s and never-registered handles — so
+# it must never be used as a taken/existence signal.
 _TAKEN_BODY_MARKERS: tuple[str, ...] = (
     "instapp:owner_user_id",
     "profile_pic_url",
-    "edge_followed_by",
-    "graphql\":{\"user",
-    "\"userID\"",
-    "\"user_id\"",
-    "PolarisProfilePostsQuery",
-    "ProfilePageContainer",
-    "\"is_private\"",
-    "\"full_name\"",
-    "\"biography\"",
-    "checkpoint_required",
+    "biography",
     "Followers",
-    "Following",
-)
-
-# Substrings that unambiguously mean Instagram never had a profile to serve.
-_AVAILABLE_BODY_MARKERS: tuple[str, ...] = (
-    "Page Not Found",
-    "Sorry, this page isn't available.",
-    "Sorry, this page isn&#039;t available.",
-    "the link you followed may be broken",
+    "og:description",
 )
 
 
@@ -226,17 +212,16 @@ class InstagramChecker:
     Tier 3 — Pure HTML inspection GET (yakuniy, deterministik qaror)
 
     Tier 3 qat'iy qoida bilan ishlaydi:
-      • TAKEN   — login/challenge/checkpoint redirect, yoki tanadagi istalgan
-                  profil-mavjudlik belgisi (owner id, follower/following
-                  meta, react/polaris kalitlari) topilsa — "not found" matni
-                  bo'lmagan holatda.
-      • AVAILABLE — faqat aniq 404, "Page Not Found" yoki "Sorry, this page
-                  isn't available." matni topilganda.
-      • Aks holda (bo'sh/noaniq javob) — xavfsiz tomonga: TAKEN. Instagram
-        haqiqatan bo'sh username uchun har doim aniq 404/not-found matni
-        qaytaradi; belgisiz bo'sh HTML deyarli har doim bloklangan/cheklangan
-        akkauntni bildiradi, shuning uchun bu holat hech qachon "indeterminate"
-        sifatida qaytarilmaydi.
+      • TAKEN   — login/challenge/checkpoint redirect, YOKI tanada haqiqiy
+                  egalik belgisi bor: owner_user_id, profile_pic_url,
+                  biography, Followers/og:description meta, yoki profilning
+                  "instagram://user?username=..." deep-link'i. Umumiy React
+                  runtime kalitlari (masalan har bir sahifada — hatto 404'da
+                  ham — uchraydigan "userID":"0"/null) signal sifatida
+                  ISHLATILMAYDI, chunki ular haqiqiy mavjudlikni bildirmaydi.
+      • AVAILABLE — yuqoridagi egalik belgilarining birortasi ham topilmasa
+                  (aniq 404/"Page Not Found" bo'ladimi yoki "Instagram"
+                  standart sarlavhali toza bo'sh shell bo'ladimi — farqi yo'q).
       • ERROR faqat tarmoq/transport darajasidagi tiklab bo'lmaydigan
         xatolarda qaytariladi.
     """
@@ -534,14 +519,15 @@ class InstagramChecker:
         html: str,
     ) -> dict[str, Any]:
         """
-        Deterministic ordered rule:
+        Deterministic two-branch rule:
           1. Redirect/gate URL → TAKEN.
-          2. Any profile-existence body marker → TAKEN.
-          3. Explicit not-found signal (404 status or not-found copy) → AVAILABLE.
-          4. Anything else (empty/ambiguous shell) → TAKEN (safe default —
-             Instagram only ever serves a markerless shell for gated
-             accounts; truly free handles always carry an explicit
-             not-found signal).
+          2. Any REAL ownership marker in the body → TAKEN.
+          3. Otherwise → AVAILABLE. Instagram never emits owner_user_id,
+             profile_pic_url, biography, Followers/og:description meta, or
+             the profile's iOS deep-link unless a profile has actually been
+             registered for that handle — so their total absence (whether
+             the page is an explicit 404 or a clean/empty 200 shell) means
+             the handle is truly free.
         """
         # ---- 1. Redirect / gate URL ----
         if any(marker in response_url for marker in _TAKEN_URL_MARKERS):
@@ -553,10 +539,12 @@ class InstagramChecker:
                 "reason": "login_or_checkpoint_redirect",
             }
 
-        # ---- 2. Profile-existence markers in the body ----
-        hit = next((m for m in _TAKEN_BODY_MARKERS if m in html), None)
+        # ---- 2. Real ownership markers in the body ----
+        deep_link_marker = f"instagram://user?username={username.lower()}"
+        ownership_markers = (*_TAKEN_BODY_MARKERS, deep_link_marker)
+        hit = next((m for m in ownership_markers if m in html), None)
         if hit is not None:
-            logger.info("[@%s] html → TAKEN (body_marker=%r)", username, hit)
+            logger.info("[@%s] html → TAKEN (ownership_marker=%r)", username, hit)
             return {
                 "kind": "ok",
                 "status": CheckStatus.TAKEN,
@@ -564,30 +552,16 @@ class InstagramChecker:
                 "reason": "profile_active_private_or_banned",
             }
 
-        # ---- 3. Explicit not-found signal ----
-        not_found_hit = next((m for m in _AVAILABLE_BODY_MARKERS if m in html), None)
-        if status_code == 404 or not_found_hit is not None:
-            logger.info(
-                "[@%s] html → AVAILABLE (status=%d, marker=%r)",
-                username, status_code, not_found_hit,
-            )
-            return {
-                "kind": "ok",
-                "status": CheckStatus.AVAILABLE,
-                "source": "html_not_found",
-                "reason": "truly_available",
-            }
-
-        # ---- 4. Ambiguous / empty shell — resolve conservatively ----
+        # ---- 3. No ownership marker present → truly available ----
         logger.info(
-            "[@%s] html → TAKEN (ambiguous_shell, status=%d, no markers either way)",
+            "[@%s] html → AVAILABLE (status=%d, no ownership markers)",
             username, status_code,
         )
         return {
             "kind": "ok",
-            "status": CheckStatus.TAKEN,
-            "source": "html_ambiguous_default",
-            "reason": "gated_or_restricted_account",
+            "status": CheckStatus.AVAILABLE,
+            "source": "html_no_ownership_marker",
+            "reason": "truly_available",
         }
 
     # ------------------------------------------------------------------
