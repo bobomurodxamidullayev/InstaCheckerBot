@@ -268,18 +268,40 @@ class InstagramChecker:
           ``{"available": true}``            → AVAILABLE, "truly_available"
           ``{"available": false}`` / errors  → TAKEN,     "username_is_taken"
           Non-200 / network failure          → ERROR,     HTTP status or exc
+
+        Key implementation notes:
+          - ``verify`` is intentionally omitted (defaults to True) so that
+            curl_cffi retains full control of the TLS handshake.  Passing
+            ``verify=False`` internally sets curl's ``-k`` flag which breaks
+            the JA3/TLS ClientHello that ``impersonate="chrome124"`` builds,
+            causing Instagram to send SSLV3_ALERT_HANDSHAKE_FAILURE.
+          - ``allow_redirects=True`` (default) is required because Instagram
+            redirects unauthenticated/malformed requests via 302 before
+            issuing the real response.  Disabling it surfaces a 404 from the
+            redirect target, not the actual API result.
+          - Cookies are injected both into the jar *and* as an explicit
+            ``Cookie:`` header so they are guaranteed to be sent on the very
+            first request (jar serialisation can be skipped if the session
+            hasn't made a prior request to the same domain).
         """
+        # Build cookie string for explicit header injection.
+        cookie_header = (
+            f"sessionid={INSTA_SESSION_ID}; csrftoken={INSTA_CSRF_TOKEN}"
+        )
+        headers = {**_API_HEADERS, "Cookie": cookie_header}
+
         session_kwargs: dict[str, Any] = {
             "impersonate": _IMPERSONATE,
             "timeout": _API_TIMEOUT,
-            "verify": False,
+            # NOTE: do NOT pass verify=False here — it breaks chrome TLS impersonation.
         }
         if self._proxy:
             session_kwargs["proxy"] = self._proxy
 
         try:
             async with AsyncSession(**session_kwargs) as session:
-                # Inject authorised session cookies.
+                # Also set the cookie jar so any subsequent redirected request
+                # within this session carries the credentials automatically.
                 session.cookies.set(
                     "sessionid", INSTA_SESSION_ID, domain=".instagram.com"
                 )
@@ -289,12 +311,10 @@ class InstagramChecker:
 
                 resp = await session.post(
                     _CHECK_USERNAME_API_URL,
-                    headers=_API_HEADERS,
+                    headers=headers,
                     data={"username": username},
                     timeout=_API_TIMEOUT,
-                    verify=False,
-                    impersonate=_IMPERSONATE,
-                    allow_redirects=False,
+                    # allow_redirects defaults to True — do NOT override to False.
                 )
 
         except _NETWORK_EXCEPTIONS as exc:
@@ -335,7 +355,9 @@ class InstagramChecker:
 
         # ── Deterministic classification ────────────────────────────────
         if data.get("available") is True:
-            logger.info("[@%s] AVAILABLE (truly_available) [check_username_api]", username)
+            logger.info(
+                "[@%s] AVAILABLE (truly_available) [check_username_api]", username
+            )
             return CheckResult(
                 username=username,
                 status=CheckStatus.AVAILABLE,
@@ -344,7 +366,9 @@ class InstagramChecker:
             )
 
         if data.get("available") is False or "errors" in data:
-            logger.info("[@%s] TAKEN (username_is_taken) [check_username_api]", username)
+            logger.info(
+                "[@%s] TAKEN (username_is_taken) [check_username_api]", username
+            )
             return CheckResult(
                 username=username,
                 status=CheckStatus.TAKEN,
