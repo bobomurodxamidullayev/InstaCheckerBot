@@ -1,4 +1,4 @@
-"""Instagram username tekshirish servisi — 3-tier pipeline."""
+"""Instagram username tekshirish servisi — 3-tier pipeline (web_profile_info API)."""
 from __future__ import annotations
 
 import asyncio
@@ -38,15 +38,18 @@ logger = logging.getLogger(__name__)
 
 _OEMBED_ENDPOINT = "https://www.instagram.com/api/v1/oembed/?url="
 _PROFILE_URL = "https://www.instagram.com/{username}/"
-_SIGNUP_PAGE_URL = "https://www.instagram.com/accounts/emailsignup/"
-_SIGNUP_ATTEMPT_URL = (
-    "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
+_PROFILE_INFO_URL = (
+    "https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
 )
+
+# Instagram's official web app ID — required by the profile-info endpoint.
+# This is the public app ID embedded in every instagram.com page load.
+_IG_APP_ID = "936619743392459"
 
 _REQUEST_TIMEOUT = 6.0
 _PROFILE_TIMEOUT = 9.0
 _DIRECT_PROFILE_TIMEOUT = 7.0
-_SIGNUP_TIMEOUT = 12.0
+_PROFILE_INFO_TIMEOUT = 10.0
 _IMPERSONATE = "chrome124"
 _CHROME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -185,9 +188,9 @@ class InstagramChecker:
     """
     Instagram username mavjudligini 3-bosqichli pipeline orqali tekshiradi.
 
-    Tier 1  — Pre-validation regex    (so'rovsiz lahzali rad etish)
-    Tier 2  — oEmbed + profile GET    (faol profilni tezkor aniqlash)
-    Tier 3  — Signup validator POST   (Instagram ro'yxatdan o'tish tekshiruvi)
+    Tier 1  — Pre-validation regex       (so'rovsiz lahzali rad etish)
+    Tier 2  — oEmbed GET                 (faol profilni tezkor aniqlash)
+    Tier 3  — web_profile_info API GET   (aniq mavjudlik tekshiruvi, 429 yo'q)
     """
 
     def __init__(self, proxy_url: str | None = None) -> None:
@@ -196,14 +199,14 @@ class InstagramChecker:
         )
         self._checking_usernames: set[str] = set()
         logger.info(
-            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=3-tier",
+            "InstagramChecker tayyor | proxy=%s | concurrent=%d | api=web_profile_info",
             "ha" if self._base_proxy else "yo'q",
             settings.concurrent_limit,
         )
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker ishga tushdi (3-tier pipeline) | proxy=%s",
+            "InstagramChecker ishga tushdi (web_profile_info pipeline) | proxy=%s",
             bool(self._base_proxy),
         )
 
@@ -355,7 +358,7 @@ class InstagramChecker:
         return None
 
     # ------------------------------------------------------------------
-    # TIER 2a — oEmbed (fast active-profile gate)
+    # TIER 2 — oEmbed (fast active-profile gate)
     # ------------------------------------------------------------------
 
     async def _try_oembed(
@@ -365,7 +368,7 @@ class InstagramChecker:
     ) -> dict[str, Any]:
         """
         Returns kind="ok" (TAKEN) when oEmbed confirms an active account.
-        Returns kind="check_required" to fall through to the profile GET.
+        Returns kind="check_required" to fall through to web_profile_info.
         """
         profile_url = f"https://www.instagram.com/{username}/"
         oembed_url = f"{_OEMBED_ENDPOINT}{quote_plus(profile_url)}"
@@ -393,32 +396,168 @@ class InstagramChecker:
             }
         return {
             "kind": "check_required",
-            "error": f"oEmbed status {status_code}; falling through to profile check",
+            "error": f"oEmbed status {status_code}; falling through to profile_info",
         }
 
     # ------------------------------------------------------------------
-    # TIER 2b — Profile HTML GET (active-profile signals only)
+    # TIER 3 — web_profile_info API GET (definitive gate)
     # ------------------------------------------------------------------
 
-    async def _try_profile_check(
+    async def _try_profile_info(
         self,
         session: AsyncSession,
         username: str,
         proxy: str | None,
     ) -> dict[str, Any]:
         """
-        Checks the public profile page for definitive TAKEN signals.
+        Queries Instagram's internal web_profile_info endpoint with the official
+        app ID header. This GET-only API never triggers 429 and correctly
+        identifies banned, deactivated, and 14-day-hold handles.
 
-        Returns:
-          kind="ok", status=TAKEN   — confirmed active / hidden / banned account
-          kind="signup_required"    — profile is empty or 404; must run Tier 3
-          kind="error"              — unrecoverable network failure
+        HTTP 200 + data.user != null → TAKEN (active account)
+        HTTP 404 + user/checkpoint/require_login in body → TAKEN (banned/deactivated)
+        HTTP 404 + "Not Found" / status:fail without user → AVAILABLE (truly free)
+        Any other / network fail → HTML fallback
+        """
+        api_url = _PROFILE_INFO_URL.format(username=quote(username, safe="._"))
+        api_headers: dict[str, str] = {
+            "User-Agent": _CHROME_USER_AGENT,
+            "X-IG-App-ID": _IG_APP_ID,
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"https://www.instagram.com/{username}/",
+        }
 
-        IMPORTANT: AVAILABLE is never returned here. An empty profile page does
-        NOT mean the handle is free — it may be banned, deactivated, or on hold.
-        Only the Tier-3 signup validator can confirm true availability.
+        response = None
+        try:
+            response = await self._request(
+                session,
+                "GET",
+                api_url,
+                api_headers,
+                timeout=_PROFILE_INFO_TIMEOUT,
+            )
+        except _NETWORK_EXCEPTIONS as proxy_error:
+            # Proxy failed — retry once with direct connection
+            if proxy:
+                try:
+                    async with AsyncSession(
+                        **self._session_kwargs(None, _PROFILE_INFO_TIMEOUT)
+                    ) as direct_session:
+                        response = await self._request(
+                            direct_session,
+                            "GET",
+                            api_url,
+                            api_headers,
+                            timeout=_PROFILE_INFO_TIMEOUT,
+                        )
+                except _NETWORK_EXCEPTIONS as direct_error:
+                    logger.warning(
+                        "[@%s] profile_info proxy+direct failed: %s — HTML fallback",
+                        username, direct_error,
+                    )
+                    return await self._html_fallback(session, username, proxy)
+            else:
+                logger.warning(
+                    "[@%s] profile_info network error: %s — HTML fallback",
+                    username, proxy_error,
+                )
+                return await self._html_fallback(session, username, proxy)
+
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        body = _body_text(response)
+        data = _parse_json_body(response) or {}
+
+        logger.debug(
+            "[@%s] profile_info status=%d body_snip=%r",
+            username, status_code, body[:160],
+        )
+
+        # ------------------------------------------------------------------
+        # HTTP 200 — check whether data.user is populated
+        # ------------------------------------------------------------------
+        if status_code == 200:
+            outer = data.get("data", {})
+            if isinstance(outer, dict):
+                user_obj = outer.get("user")
+                if user_obj is not None:
+                    # data.user present (even if private) → account exists
+                    logger.info("[@%s] profile_info 200 → TAKEN (profile_active)", username)
+                    return {
+                        "kind": "ok",
+                        "status": CheckStatus.TAKEN,
+                        "source": "profile_info_200",
+                        "reason": "profile_active",
+                    }
+            # 200 but data.user is null or missing — treat same as 404 logic below
+            logger.debug("[@%s] profile_info 200 but data.user null — treating as 404", username)
+            status_code = 0  # fall through to 404 branch
+
+        # ------------------------------------------------------------------
+        # HTTP 404 — distinguish banned/deactivated from truly unclaimed
+        # ------------------------------------------------------------------
+        if status_code == 404 or status_code == 0:
+            # Signals that the handle exists in Instagram's DB but is hidden
+            _exists_signals = ("user", "checkpoint", "require_login")
+            if any(sig in body for sig in _exists_signals):
+                logger.info(
+                    "[@%s] profile_info 404+signals → TAKEN (banned_or_deactivated)", username
+                )
+                return {
+                    "kind": "ok",
+                    "status": CheckStatus.TAKEN,
+                    "source": "profile_info_404_exists",
+                    "reason": "banned_or_deactivated",
+                }
+
+            # Clean not-found: "Not Found" text OR status:fail without any user object
+            _not_found_signals = ("Not Found", "\"status\": \"fail\"", "\"status\":\"fail\"")
+            if any(sig in body for sig in _not_found_signals) or not any(
+                sig in body for sig in _exists_signals
+            ):
+                logger.info(
+                    "[@%s] profile_info 404+not-found → AVAILABLE (truly_available)", username
+                )
+                return {
+                    "kind": "ok",
+                    "status": CheckStatus.AVAILABLE,
+                    "source": "profile_info_404_clean",
+                    "reason": "truly_available",
+                }
+
+        # ------------------------------------------------------------------
+        # Unexpected status (e.g. 302, 429, 500) — fall back to HTML check
+        # ------------------------------------------------------------------
+        logger.warning(
+            "[@%s] profile_info unexpected status=%d — HTML fallback", username, status_code
+        )
+        return await self._html_fallback(session, username, proxy)
+
+    # ------------------------------------------------------------------
+    # HTML fallback (used only when profile_info is indeterminate)
+    # ------------------------------------------------------------------
+
+    async def _html_fallback(
+        self,
+        session: AsyncSession,
+        username: str,
+        proxy: str | None,
+    ) -> dict[str, Any]:
+        """
+        Fallback: fetch the public profile HTML page and inspect for signals.
+
+        TAKEN when any of:
+          • Redirect to /accounts/login or URL contains checkpoint
+          • "instapp:owner_user_id" in HTML
+          • "Followers" in HTML
+
+        AVAILABLE when:
+          • "Page Not Found" in HTML or HTTP 404
+
+        ERROR when none of the above match.
         """
         profile_url = _PROFILE_URL.format(username=quote(username, safe="._"))
+        response = None
         try:
             response = await self._request(
                 session,
@@ -427,33 +566,35 @@ class InstagramChecker:
                 _PROFILE_HEADERS,
                 timeout=_PROFILE_TIMEOUT,
             )
-        except _NETWORK_EXCEPTIONS as proxy_error:
-            if not proxy:
-                return {
-                    "kind": "error",
-                    "error": f"profile check network error: {proxy_error}",
-                }
-            # Retry once without proxy
-            try:
-                async with AsyncSession(
-                    **self._session_kwargs(None, _DIRECT_PROFILE_TIMEOUT)
-                ) as direct_session:
-                    response = await self._request(
-                        direct_session,
-                        "GET",
-                        profile_url,
-                        _PROFILE_HEADERS,
-                        timeout=_DIRECT_PROFILE_TIMEOUT,
-                    )
-            except _NETWORK_EXCEPTIONS as direct_error:
-                return {
-                    "kind": "error",
-                    "error": f"profile check proxy and direct both failed: {direct_error}",
-                }
+        except _NETWORK_EXCEPTIONS as exc:
+            if proxy:
+                try:
+                    async with AsyncSession(
+                        **self._session_kwargs(None, _DIRECT_PROFILE_TIMEOUT)
+                    ) as direct_session:
+                        response = await self._request(
+                            direct_session,
+                            "GET",
+                            profile_url,
+                            _PROFILE_HEADERS,
+                            timeout=_DIRECT_PROFILE_TIMEOUT,
+                        )
+                except _NETWORK_EXCEPTIONS as direct_error:
+                    return {
+                        "kind": "error",
+                        "error": f"HTML fallback proxy+direct failed: {direct_error}",
+                    }
+            else:
+                return {"kind": "error", "error": f"HTML fallback network error: {exc}"}
+
+        if response is None:
+            return {"kind": "error", "error": "HTML fallback: no response"}
 
         response_url = str(getattr(response, "url", ""))
+        sc = int(getattr(response, "status_code", 0) or 0)
+        html = _body_text(response)
 
-        # Checkpoint / challenge via proxy → retry direct
+        # Checkpoint redirect via proxy — retry direct once
         if "checkpoint" in response_url or "challenge" in response_url:
             try:
                 async with AsyncSession(
@@ -466,241 +607,54 @@ class InstagramChecker:
                         _PROFILE_HEADERS,
                         timeout=_DIRECT_PROFILE_TIMEOUT,
                     )
-            except _NETWORK_EXCEPTIONS as direct_error:
-                return {
-                    "kind": "error",
-                    "error": f"profile check direct retry failed: {direct_error}",
-                }
-            response_url = str(getattr(response, "url", ""))
+                response_url = str(getattr(response, "url", ""))
+                sc = int(getattr(response, "status_code", 0) or 0)
+                html = _body_text(response)
+            except _NETWORK_EXCEPTIONS:
+                pass  # continue with what we have
 
-        raw_text = _body_text(response)
-        username_lower = username.lower()
-
-        # ------------------------------------------------------------------
-        # Definite TAKEN signals — stop here, no Tier 3 needed
-        # ------------------------------------------------------------------
-
-        # Login or checkpoint redirect → account hidden (banned / deactivated / private)
-        if "/accounts/login" in response_url or "checkpoint" in response_url:
-            return {
-                "kind": "ok",
-                "status": CheckStatus.TAKEN,
-                "source": "login_redirect",
-                "reason": "profile_active_or_banned",
-            }
-
-        # Standard profile metadata → active public / private account
+        # TAKEN signals
         if (
-            "instapp:owner_user_id" in raw_text
-            or "og:description" in raw_text
-            or "Followers" in raw_text
-            or f"instagram://user?username={username_lower}" in raw_text
+            "/accounts/login" in response_url
+            or "checkpoint" in response_url
+            or "instapp:owner_user_id" in html
+            or "Followers" in html
         ):
             return {
                 "kind": "ok",
                 "status": CheckStatus.TAKEN,
-                "source": "profile_active_meta",
+                "source": "html_fallback",
                 "reason": "profile_active_or_banned",
             }
 
-        # ------------------------------------------------------------------
-        # No identity signals — profile is empty shell or 404.
-        # MUST go to Tier 3 signup validator. Never assume AVAILABLE here.
-        # ------------------------------------------------------------------
-        return {"kind": "signup_required"}
-
-    # ------------------------------------------------------------------
-    # TIER 3 — Instagram Signup Validator (definitive availability gate)
-    # ------------------------------------------------------------------
-
-    async def _try_signup_validation(
-        self,
-        username: str,
-        proxy: str | None,
-    ) -> dict[str, Any]:
-        """
-        POSTs to Instagram's registration attempt endpoint using a fresh session
-        seeded by a GET to the email-signup page (which sets csrftoken cookie).
-
-        Instagram's signup validator queries the full account database — active,
-        banned, deactivated, 14-day deletion hold, and reserved handles all
-        produce a username error. Only genuinely unclaimed handles return ok.
-
-        Evaluation
-        ----------
-        HTTP 200 + "username_is_taken" in body      → TAKEN, "username_is_taken"
-        HTTP 200 + errors.username present in JSON  → TAKEN, "username_is_taken"
-        HTTP 200 + status=="ok" / no username error → AVAILABLE, "truly_available"
-        HTTP 429 (proxy)                            → retry once via direct IP
-        HTTP 429 (direct retry)                     → ERROR — NEVER AVAILABLE
-        Network / non-200                           → ERROR
-        """
-        async def _attempt(sess_proxy: str | None) -> dict[str, Any]:
-            async with AsyncSession(
-                **self._session_kwargs(sess_proxy, _SIGNUP_TIMEOUT)
-            ) as sess:
-                # Step 1: seed csrftoken cookie via signup page GET
-                csrftoken = ""
-                try:
-                    await sess.get(
-                        _SIGNUP_PAGE_URL,
-                        headers=_PROFILE_HEADERS,
-                        timeout=_SIGNUP_TIMEOUT,
-                        verify=False,
-                        impersonate=_IMPERSONATE,
-                    )
-                    cookies = getattr(sess, "cookies", None)
-                    if cookies is not None:
-                        csrftoken = cookies.get("csrftoken", "") or ""
-                except _NETWORK_EXCEPTIONS:
-                    pass  # fall back to hex token below
-
-                if not csrftoken:
-                    csrftoken = secrets.token_hex(16)
-
-                signup_headers: dict[str, str] = {
-                    "User-Agent": _CHROME_USER_AGENT,
-                    "Accept": "*/*",
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "X-CSRFToken": csrftoken,
-                    "X-Requested-With": "XMLHttpRequest",
-                    "Referer": _SIGNUP_PAGE_URL,
-                    "Origin": "https://www.instagram.com",
-                }
-
-                payload: dict[str, str] = {
-                    "email": f"check_{secrets.token_hex(4)}@gmail.com",
-                    "username": username,
-                    "first_name": "Test User",
-                    "opt_into_one_tap": "false",
-                }
-
-                # Step 2: POST registration attempt
-                try:
-                    resp = await self._request(
-                        sess,
-                        "POST",
-                        _SIGNUP_ATTEMPT_URL,
-                        signup_headers,
-                        data=payload,
-                        allow_redirects=False,
-                        timeout=_SIGNUP_TIMEOUT,
-                    )
-                except _NETWORK_EXCEPTIONS as exc:
-                    return {"kind": "error", "error": f"signup POST network error: {exc}"}
-
-                sc = int(getattr(resp, "status_code", 0) or 0)
-                return {"kind": "response", "resp": resp, "status_code": sc}
-
-        # ---- Attempt 1: use proxy ----
-        result = await _attempt(proxy)
-        if result["kind"] == "error":
-            logger.warning(
-                "[@%s] signup validator network error: %s → ERROR",
-                username, result["error"],
-            )
-            return {"kind": "error", "error": result["error"]}
-
-        sc: int = result["status_code"]
-
-        # ---- Retry via direct IP on 429 ----
-        if sc == 429:
-            logger.warning(
-                "[@%s] signup validator 429 — retrying via direct IP", username
-            )
-            result = await _attempt(None)
-            if result["kind"] == "error":
-                return {"kind": "error", "error": result["error"]}
-            sc = result["status_code"]
-            if sc == 429:
-                # Still rate-limited — NEVER mark AVAILABLE on 429
-                logger.error(
-                    "[@%s] signup validator still 429 after direct retry → ERROR", username
-                )
-                return {"kind": "error", "error": "signup_validator_rate_limited_429"}
-
-        resp = result["resp"]
-
-        if sc != 200:
-            logger.warning(
-                "[@%s] signup validator unexpected status %d → ERROR", username, sc
-            )
-            return {"kind": "error", "error": f"signup_validator_status_{sc}"}
-
-        # ---- Evaluate the response ----
-        body = _body_text(resp)
-        data = _parse_json_body(resp) or {}
-
-        logger.debug(
-            "[@%s] signup validator status=%d body_snip=%r", username, sc, body[:160]
-        )
-
-        # Explicit "taken" keyword in raw body (covers all languages/formats)
-        if "username_is_taken" in body:
-            logger.info("[@%s] signup → TAKEN (username_is_taken in body)", username)
-            return {
-                "kind": "ok",
-                "status": CheckStatus.TAKEN,
-                "source": "signup_validator",
-                "reason": "username_is_taken",
-            }
-
-        # Explicit username error in the JSON errors dict
-        errors = data.get("errors", {})
-        if isinstance(errors, dict) and errors.get("username"):
-            logger.info("[@%s] signup → TAKEN (errors.username in JSON)", username)
-            return {
-                "kind": "ok",
-                "status": CheckStatus.TAKEN,
-                "source": "signup_validator",
-                "reason": "username_is_taken",
-            }
-
-        # Instagram returned status="ok" with no username field touched → free handle
-        if data.get("status") == "ok" or "username" not in body:
-            logger.info("[@%s] signup → AVAILABLE (truly_available)", username)
+        # AVAILABLE signals
+        if sc == 404 or "Page Not Found" in html or "Sorry, this page isn't available" in html:
             return {
                 "kind": "ok",
                 "status": CheckStatus.AVAILABLE,
-                "source": "signup_validator",
+                "source": "html_fallback",
                 "reason": "truly_available",
             }
 
-        # Ambiguous body (no clear ok / no clear error) → conservative ERROR
-        logger.warning(
-            "[@%s] signup validator ambiguous body (status=%d) → ERROR", username, sc
-        )
-        return {
-            "kind": "error",
-            "error": f"signup_validator_ambiguous (status={sc})",
-        }
+        # Indeterminate
+        return {"kind": "error", "error": f"html_fallback_indeterminate (status={sc})"}
 
     # ------------------------------------------------------------------
-    # Funnel: Tier 2a → Tier 2b → Tier 3
+    # Funnel: Tier 1 → Tier 2 → Tier 3
     # ------------------------------------------------------------------
 
     async def _funnel_check(self, username: str, proxy: str | None) -> dict[str, Any]:
         kwargs = self._session_kwargs(proxy)
         async with AsyncSession(**kwargs) as session:
-            # ---- TIER 2a: oEmbed (fast active-profile gate) ----
+            # ---- TIER 2: oEmbed (fast active-profile gate) ----
             oembed = await self._try_oembed(session, username)
             if oembed["kind"] == "ok":
                 return oembed
             if oembed["kind"] not in ("check_required",):
                 return oembed  # propagate unexpected errors
 
-            # ---- TIER 2b: profile HTML GET ----
-            profile = await self._try_profile_check(session, username, proxy)
-            if profile["kind"] == "ok":
-                return profile
-            if profile["kind"] == "error":
-                return profile
-
-            # kind == "signup_required": profile was empty / 404 shell.
-            # MUST run Tier 3 — NEVER assume AVAILABLE on an empty profile alone.
-            # ---- TIER 3: signup validator (definitive availability gate) ----
-            return await self._try_signup_validation(username, proxy)
+            # ---- TIER 3: web_profile_info API GET (definitive) ----
+            return await self._try_profile_info(session, username, proxy)
 
 
 instagram_checker = InstagramChecker()
