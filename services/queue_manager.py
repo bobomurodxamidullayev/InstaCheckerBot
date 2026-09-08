@@ -157,7 +157,9 @@ async def run_bulk_check(
                 base_jitter = random.uniform(0.3, 0.8)
                 await asyncio.sleep(max(base_jitter, jitter_delay * 0.3))
 
-                result = await instagram_checker.check_username(username)
+                result = await instagram_checker.check_username(
+                    username, max_retries=3,
+                )
 
         except Exception as exc:
             logger.exception(
