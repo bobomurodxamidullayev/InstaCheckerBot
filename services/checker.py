@@ -69,14 +69,13 @@ _BROWSER_HEADERS: dict[str, str] = {
     "Upgrade-Insecure-Requests": "1",
 }
 
-# Step 2 — check_username API
-_CHECK_USERNAME_URL = "https://www.instagram.com/api/v1/web/accounts/check_username/"
+# Step 2 — Password Recovery AJAX (ban/bo'sh aniq ajratadi)
+_RECOVERY_URL = "https://www.instagram.com/api/v1/web/accounts/account_recovery_send_ajax/"
 
-_CHECK_USERNAME_HEADERS: dict[str, str] = {
+_RECOVERY_HEADERS: dict[str, str] = {
     "User-Agent": _CHROME_USER_AGENT,
-    "X-CSRFToken": "missing",
     "X-Requested-With": "XMLHttpRequest",
-    "Referer": "https://www.instagram.com/accounts/emailsignup/",
+    "Referer": "https://www.instagram.com/accounts/password/reset/",
     "Content-Type": "application/x-www-form-urlencoded",
 }
 
@@ -306,7 +305,7 @@ class InstagramChecker:
 
         # Step 1 profil topmadi → Step 2 ga o'tish
         await asyncio.sleep(random.uniform(0.3, 0.8))
-        return await self._step2_check_username_api(username)
+        return await self._step2_recovery_check(username)
 
     # ------------------------------------------------------------------
     # Step 1 — Profile Page GET (tezkor, TAKEN aniqlash)
@@ -481,20 +480,21 @@ class InstagramChecker:
         return None
 
     # ------------------------------------------------------------------
-    # Step 2 — check_username API (aniq AVAILABLE / TAKEN)
+    # Step 2 — Password Recovery AJAX (aniq AVAILABLE / TAKEN)
     # ------------------------------------------------------------------
 
-    async def _step2_check_username_api(
+    async def _step2_recovery_check(
         self, username: str
     ) -> CheckResult:
         """
-        POST /api/v1/web/accounts/check_username/
+        POST /api/v1/web/accounts/account_recovery_send_ajax/
         via curl_cffi (Chrome TLS fingerprint).
 
-        BAN / DEACTIVATED nomlarni ham to'g'ri aniqlaydi:
-          available: true                           → AVAILABLE
-          status: fail / username_is_taken / errors → TAKEN
-          429 / login redirect                      → ERROR
+        Parol tiklash endpointi — ban/deactivated/bo'sh nomlarni aniq ajratadi:
+          "No users found" / "user_not_found"  → AVAILABLE
+          HTTP 200 / email_sent / sms_sent /
+          checkpoint / feedback_required       → TAKEN
+          429                                  → ERROR
         """
         session_kwargs: dict[str, Any] = {
             "impersonate": _IMPERSONATE,
@@ -511,9 +511,9 @@ class InstagramChecker:
             try:
                 async with AsyncSession(**session_kwargs) as session:
                     resp = await session.post(
-                        _CHECK_USERNAME_URL,
-                        headers=_CHECK_USERNAME_HEADERS,
-                        data=f"username={username}",
+                        _RECOVERY_URL,
+                        headers=_RECOVERY_HEADERS,
+                        data=f"email_or_username={username}",
                     )
                 break
 
@@ -580,24 +580,34 @@ class InstagramChecker:
                 username, CheckStatus.ERROR, f"step2_redirect_{sc}"
             )
 
+        # Response body text
+        body_text = ""
+        try:
+            body_text = str(getattr(resp, "text", "") or "")
+        except Exception:
+            pass
+        body_lower = body_text.lower()
+
+        # ── AVAILABLE: "No users found" yoki "user_not_found" ──────
+        if "no users found" in body_lower or "user_not_found" in body_lower:
+            logger.info(
+                "[@%s] AVAILABLE (recovery: no users found) [Step 2]",
+                username,
+            )
+            return CheckResult(
+                username, CheckStatus.AVAILABLE, "truly_available"
+            )
+
         # JSON parse
         data = _safe_json_curl(resp)
 
         if data is None:
-            body_preview = ""
-            try:
-                body_preview = (resp.text or "")[:200]
-            except Exception:
-                pass
+            body_preview = body_text[:200] if body_text else "(empty)"
             logger.warning(
                 "[@%s] Step2: non-JSON (HTTP %d) | body=%s",
                 username, sc, body_preview,
             )
-            # Login sahifasi HTML bo'lishi mumkin
-            if body_preview and (
-                "/accounts/login/" in body_preview.lower()
-                or "login" in body_preview.lower()
-            ):
+            if "/accounts/login/" in body_lower or "login" in body_lower:
                 return CheckResult(
                     username, CheckStatus.ERROR, "step2_login_page"
                 )
@@ -610,53 +620,48 @@ class InstagramChecker:
             username, sc, json.dumps(data, ensure_ascii=False)[:300],
         )
 
-        # ── AVAILABLE: status=ok va available=true ─────────────────
-        if data.get("status") == "ok" and data.get("available") is True:
-            logger.info(
-                "[@%s] AVAILABLE (check_username: available=true) [Step 2]",
-                username,
-            )
-            return CheckResult(
-                username, CheckStatus.AVAILABLE, "truly_available"
-            )
-
-        # ── TAKEN: username_is_taken error_type ────────────────────
-        error_type = str(data.get("error_type", ""))
-        if error_type == "username_is_taken":
-            logger.info(
-                "[@%s] TAKEN (check_username: username_is_taken) [Step 2]",
-                username,
-            )
-            return CheckResult(
-                username, CheckStatus.TAKEN, "username_is_taken"
-            )
-
-        # ── TAKEN: errors.username mavjud ──────────────────────────
-        errors = data.get("errors", {})
-        if isinstance(errors, dict) and errors.get("username"):
-            username_errors = errors["username"]
-            if isinstance(username_errors, list):
-                err_detail = "; ".join(
-                    e.get("message", str(e)) if isinstance(e, dict) else str(e)
-                    for e in username_errors
+        # ── TAKEN: akkaunt mavjud belgilari ────────────────────────
+        # email_sent, sms_sent → parol tiklash yuborildi (akkaunt bor)
+        # checkpoint_required, feedback_required → akkaunt bor, lekin cheklangan
+        taken_signals = ("email_sent", "sms_sent", "obfuscated_login")
+        for key in taken_signals:
+            if data.get(key):
+                logger.info(
+                    "[@%s] TAKEN (recovery: %s) [Step 2]", username, key,
                 )
-            else:
-                err_detail = str(username_errors)
+                return CheckResult(
+                    username, CheckStatus.TAKEN, "account_exists"
+                )
+
+        # status=ok → akkaunt mavjud (recovery jarayoni boshlandi)
+        if sc == 200 and data.get("status") == "ok":
             logger.info(
-                "[@%s] TAKEN (check_username: errors.username=%s) [Step 2]",
-                username, err_detail[:100],
+                "[@%s] TAKEN (recovery: status=ok, HTTP 200) [Step 2]",
+                username,
             )
             return CheckResult(
-                username, CheckStatus.TAKEN, "username_is_taken"
+                username, CheckStatus.TAKEN, "account_exists"
             )
 
-        # ── TAKEN: status=fail (boshqa sabablar) ──────────────────
+        # checkpoint_required / feedback_required → akkaunt mavjud
+        error_type = str(data.get("error_type", ""))
+        if error_type in (
+            "checkpoint_required", "checkpoint_challenge_required",
+            "feedback_required",
+        ):
+            logger.info(
+                "[@%s] TAKEN (recovery: %s) [Step 2]", username, error_type,
+            )
+            return CheckResult(
+                username, CheckStatus.TAKEN, "account_exists_restricted"
+            )
+
+        # ── Rate limit / IP block → ERROR ──────────────────────────
         if data.get("status") == "fail":
             message = str(data.get("message", ""))
             msg_lower = message.lower()
 
-            # Rate limit
-            if any(w in msg_lower for w in ("wait", "try again", "rate")):
+            if any(w in msg_lower for w in ("wait", "try again", "rate", "few minutes")):
                 logger.warning(
                     "[@%s] Step2 rate limit: %s", username, message[:80],
                 )
@@ -664,9 +669,7 @@ class InstagramChecker:
                     username, CheckStatus.ERROR, "step2_rate_limit"
                 )
 
-            # Checkpoint / spam / IP block → ERROR
             if error_type in (
-                "checkpoint_required", "checkpoint_challenge_required",
                 "spam", "rate_limit_error", "sentry_block",
                 "generic_request_error", "ip_block",
             ):
@@ -677,26 +680,7 @@ class InstagramChecker:
                     username, CheckStatus.ERROR, f"step2_block_{error_type}"
                 )
 
-            # Boshqa fail → TAKEN (username band)
-            logger.info(
-                "[@%s] TAKEN (check_username: status=fail, %s) [Step 2]",
-                username, error_type or "unknown",
-            )
-            return CheckResult(
-                username, CheckStatus.TAKEN, f"taken_fail_{error_type or 'unknown'}"
-            )
-
-        # ── TAKEN: available=false (aniq) ──────────────────────────
-        if data.get("available") is False:
-            logger.info(
-                "[@%s] TAKEN (check_username: available=false) [Step 2]",
-                username,
-            )
-            return CheckResult(
-                username, CheckStatus.TAKEN, "username_is_taken"
-            )
-
-        # ── Noaniq → ERROR (HECH QACHON fallback AVAILABLE emas!) ─
+        # ── Noaniq → ERROR ─────────────────────────────────────────
         logger.warning(
             "[@%s] Step2: noaniq javob -> ERROR | HTTP %d | body=%s",
             username, sc, str(data)[:200],
