@@ -1,16 +1,19 @@
-"""Instagram username availability checker — Hybrid (Profile Page + check_username).
+"""Instagram username availability checker — Single GET (?__a=1&__d=dis).
 
 Architecture:
   Tier 1  — Regex / syntax / reserved pre-validation (no network).
-  Tier 2  — Two-step hybrid check:
-             Step 1 (Tezkor): GET https://www.instagram.com/{username}/
-               Agar profil signallari (meta stats, profile title) bo'lsa
-               → darhol TAKEN.
-             Step 2 (Aniq): POST /api/v1/web/accounts/check_username/
-               Faqat Step 1 da profil topilmasa ishga tushadi.
-               BAN / DEACTIVATED nomlarni ham to'g'ri aniqlaydi.
+  Tier 2  — Single browser-like GET request:
+             GET https://www.instagram.com/{username}/?__a=1&__d=dis
+             via curl_cffi (Chrome TLS fingerprint).
 
-ANONIM REJIM: Hech qanday Instagram akkaunt yoki session cookie talab etilmaydi.
+             HTTP 404                              → AVAILABLE
+             HTTP 200 + JSON user data             → TAKEN (active)
+             HTTP 200 + HTML profil meta teglari   → TAKEN (active)
+             HTTP 200 + bo'sh "Instagram" qobig'i  → TAKEN (banned/disabled)
+             HTTP 302 / 429                        → ERROR (qayta urinish)
+
+ANONIM REJIM: Hech qanday POST, session, CSRF, API key ishlatilmaydi.
+Faqat bitta GET so'rov — brauzer kabi.
 """
 from __future__ import annotations
 
@@ -42,18 +45,15 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_IMPERSONATE = "chrome124"
+_PROFILE_URL_TPL = "https://www.instagram.com/{}/?__a=1&__d=dis"
 _PAGE_TIMEOUT = 12.0
-_API_TIMEOUT = 12.0
+_IMPERSONATE = "chrome124"
 _PROXY_RETRY_DELAY = 1.0
 
 _CHROME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-
-# Step 1 — Profile page
-_PROFILE_URL_TPL = "https://www.instagram.com/{}/"
 
 _BROWSER_HEADERS: dict[str, str] = {
     "User-Agent": _CHROME_USER_AGENT,
@@ -67,16 +67,6 @@ _BROWSER_HEADERS: dict[str, str] = {
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
-}
-
-# Step 2 — Password Recovery AJAX (ban/bo'sh aniq ajratadi)
-_RECOVERY_URL = "https://www.instagram.com/api/v1/web/accounts/account_recovery_send_ajax/"
-
-_RECOVERY_HEADERS: dict[str, str] = {
-    "User-Agent": _CHROME_USER_AGENT,
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": "https://www.instagram.com/accounts/password/reset/",
-    "Content-Type": "application/x-www-form-urlencoded",
 }
 
 # Network exceptions
@@ -95,20 +85,13 @@ _RESERVED_NAMES: frozenset[str] = frozenset({
 
 # HTML parsing patterns
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
-_OG_DESC_RE = re.compile(
-    r'<meta\s+property="og:description"\s+content="(.*?)"',
+_OG_TITLE_RE = re.compile(
+    r'<meta\s+(?:property|name)="og:title"\s+content="([^"]*)"',
     re.IGNORECASE,
 )
-
-# "Page Not Found" / "Isn't Available" detection phrases
-_NOT_FOUND_PHRASES = (
-    "page not found",
-    "isn't available",
-    "isn\u2019t available",
-    "this page isn",
-    "content unavailable",
-    "sorry, this page",
-    "the link you followed may be broken",
+_OG_DESC_RE = re.compile(
+    r'<meta\s+property="og:description"\s+content="([^"]*)"',
+    re.IGNORECASE,
 )
 
 
@@ -141,8 +124,8 @@ class CheckResult:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _safe_json_curl(resp: Any) -> dict[str, Any] | None:
-    """Safely parse JSON dict from curl_cffi response."""
+def _try_parse_json(resp: Any) -> dict[str, Any] | None:
+    """Try to parse JSON from curl_cffi response. Returns None if not JSON."""
     try:
         data = resp.json()
         if isinstance(data, dict):
@@ -163,22 +146,46 @@ def _safe_json_curl(resp: Any) -> dict[str, Any] | None:
         return None
 
 
+def _extract_user_from_json(data: dict[str, Any]) -> dict[str, Any] | None:
+    """Extract user object from Instagram JSON response."""
+    # Format 1: {"graphql": {"user": {...}}}
+    graphql = data.get("graphql")
+    if isinstance(graphql, dict):
+        user = graphql.get("user")
+        if isinstance(user, dict):
+            return user
+
+    # Format 2: {"data": {"user": {...}}}
+    data_block = data.get("data")
+    if isinstance(data_block, dict):
+        user = data_block.get("user")
+        if isinstance(user, dict):
+            return user
+
+    # Format 3: {"user": {...}} (to'g'ridan-to'g'ri)
+    user = data.get("user")
+    if isinstance(user, dict):
+        return user
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Main checker class
 # ---------------------------------------------------------------------------
 
 class InstagramChecker:
     """
-    Anonim Instagram username availability checker — Hybrid.
+    Anonim Instagram username availability checker — Single GET.
 
-    2 bosqichli tekshiruv:
-      Step 1: GET /{username}/ → profil signallari bo'lsa → darhol TAKEN.
-      Step 2: POST check_username → aniq AVAILABLE / TAKEN (ban/deactivated ham).
+    Faqat bitta GET so'rov: /{username}/?__a=1&__d=dis
+    Hech qanday POST, session, CSRF, API key ishlatilmaydi.
 
-    QOIDALAR:
-      AVAILABLE — FAQAT check_username API ``available: true`` tasdiqladi.
-      TAKEN     — Profil mavjud YOKI check_username ``username_is_taken``.
-      ERROR     — Network/proxy/429/redirect infra muammo.
+    TEMIR QONUNLAR:
+      404                            → AVAILABLE (haqiqiy bo'sh nom)
+      200 + JSON/HTML profil data    → TAKEN (faol akkaunt)
+      200 + bo'sh Instagram qobig'i → TAKEN (banned/disabled)
+      302 / 429                      → ERROR (proksi IP cheklovi)
     """
 
     def __init__(self, proxy_url: str | None = None) -> None:
@@ -188,7 +195,7 @@ class InstagramChecker:
         self._in_flight: set[str] = set()
 
         logger.info(
-            "InstagramChecker ready (Hybrid: Profile Page + check_username) | proxy=%s",
+            "InstagramChecker ready (Single GET + curl_cffi) | proxy=%s",
             bool(self._proxy),
         )
 
@@ -197,7 +204,7 @@ class InstagramChecker:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        logger.info("InstagramChecker started (Hybrid mode)")
+        logger.info("InstagramChecker started (Single GET, no POST)")
 
     async def stop(self) -> None:
         logger.info("InstagramChecker stopped.")
@@ -215,13 +222,13 @@ class InstagramChecker:
         Instagram username mavjudligini tekshirish.
 
         Returns:
-          AVAILABLE — check_username API tasdiqladi.
-          TAKEN     — Profil mavjud yoki check_username rad etdi.
+          AVAILABLE — 404 (haqiqiy bo'sh nom).
+          TAKEN     — Profil mavjud yoki banned/disabled.
           ERROR     — Infra muammo (network/proxy/429/redirect).
         """
         clean = username.strip().lstrip("@").lower()
 
-        # Tier 1
+        # Tier 1 — lokal validatsiya
         tier1 = self._tier1_prevalidate(clean)
         if tier1 is not None:
             status, reason = tier1
@@ -239,7 +246,7 @@ class InstagramChecker:
 
             last: CheckResult | None = None
             for attempt in range(1, max_retries + 1):
-                result = await self._hybrid_check(clean)
+                result = await self._single_get_check(clean)
                 result.attempts = attempt
 
                 if result.status != CheckStatus.ERROR:
@@ -290,37 +297,19 @@ class InstagramChecker:
         return None
 
     # ------------------------------------------------------------------
-    # Hybrid check: Step 1 -> Step 2
+    # Single GET check — /{username}/?__a=1&__d=dis
     # ------------------------------------------------------------------
 
-    async def _hybrid_check(self, username: str) -> CheckResult:
+    async def _single_get_check(self, username: str) -> CheckResult:
         """
-        Step 1: Profil sahifasi → TAKEN (agar profil signallari bo'lsa).
-        Step 2: check_username API → AVAILABLE / TAKEN (ban/deactivated ham).
-        """
-        # Step 1 — tezkor profil sahifasi tekshiruvi
-        step1 = await self._step1_profile_page(username)
-        if step1 is not None:
-            return step1
+        GET https://www.instagram.com/{username}/?__a=1&__d=dis
 
-        # Step 1 profil topmadi → Step 2 ga o'tish
-        await asyncio.sleep(random.uniform(0.3, 0.8))
-        return await self._step2_recovery_check(username)
-
-    # ------------------------------------------------------------------
-    # Step 1 — Profile Page GET (tezkor, TAKEN aniqlash)
-    # ------------------------------------------------------------------
-
-    async def _step1_profile_page(
-        self, username: str
-    ) -> CheckResult | None:
-        """
-        GET https://www.instagram.com/{username}/
-
-        Returns:
-          CheckResult(TAKEN) — agar profil signallari topilsa.
-          None               — agar profil topilmasa (Step 2 ga o'tish kerak).
-          CheckResult(ERROR) — infra muammo (429/redirect/network).
+        TEMIR QONUNLAR:
+          404 → AVAILABLE
+          200 + JSON user data → TAKEN (faol)
+          200 + HTML profil meta → TAKEN (faol)
+          200 + bo'sh qobiq (faqat "Instagram" title) → TAKEN (banned/disabled)
+          302 / 429 → ERROR
         """
         url = _PROFILE_URL_TPL.format(username)
 
@@ -332,6 +321,7 @@ class InstagramChecker:
         if self._proxy:
             session_kwargs["proxy"] = self._proxy
 
+        # Proksi retry: 2 urinish
         max_proxy_retries = 2
         resp = None
 
@@ -348,50 +338,50 @@ class InstagramChecker:
             except _CURL_NETWORK_EXCEPTIONS as exc:
                 if proxy_attempt < max_proxy_retries:
                     logger.warning(
-                        "[@%s] Step1 proksi xato (%d/%d), %gs kutib qayta: %s",
+                        "[@%s] Proksi xato (%d/%d), %gs kutib qayta: %s",
                         username, proxy_attempt, max_proxy_retries,
                         _PROXY_RETRY_DELAY, exc,
                     )
                     await asyncio.sleep(_PROXY_RETRY_DELAY)
                     continue
                 logger.warning(
-                    "[@%s] Step1 network xato (barcha urinishlar): %s",
+                    "[@%s] Network xato (barcha urinishlar): %s",
                     username, exc,
                 )
                 return CheckResult(
                     username, CheckStatus.ERROR,
-                    f"step1_network_{type(exc).__name__}",
+                    f"network_{type(exc).__name__}",
                 )
 
             except Exception as exc:
                 if proxy_attempt < max_proxy_retries:
                     logger.warning(
-                        "[@%s] Step1 kutilmagan xato (%d/%d): %s",
+                        "[@%s] Kutilmagan xato (%d/%d): %s",
                         username, proxy_attempt, max_proxy_retries, exc,
                     )
                     await asyncio.sleep(_PROXY_RETRY_DELAY)
                     continue
                 logger.warning(
-                    "[@%s] Step1 kutilmagan (barcha): %s", username, exc,
+                    "[@%s] Kutilmagan xato (barcha): %s", username, exc,
                 )
                 return CheckResult(
                     username, CheckStatus.ERROR,
-                    f"step1_unexpected_{type(exc).__name__}",
+                    f"unexpected_{type(exc).__name__}",
                 )
 
         if resp is None:
             return CheckResult(
-                username, CheckStatus.ERROR, "step1_all_retries_failed"
+                username, CheckStatus.ERROR, "all_retries_failed"
             )
 
         sc = int(getattr(resp, "status_code", 0) or 0)
 
-        # 429 → ERROR
+        # ── 429 → ERROR ───────────────────────────────────────────
         if sc == 429:
-            logger.warning("[@%s] Step1: 429 (rate limited)", username)
-            return CheckResult(username, CheckStatus.ERROR, "step1_429")
+            logger.warning("[@%s] 429 (rate limited)", username)
+            return CheckResult(username, CheckStatus.ERROR, "rate_limit_429")
 
-        # Redirect → ERROR
+        # ── 302+ redirect → ERROR ─────────────────────────────────
         if sc in (301, 302, 303, 307, 308):
             location = ""
             try:
@@ -401,19 +391,70 @@ class InstagramChecker:
             except Exception:
                 pass
             logger.warning(
-                "[@%s] Step1: redirect (%d) -> %s",
-                username, sc, location[:100],
+                "[@%s] Redirect (%d) -> %s", username, sc, location[:100],
             )
             return CheckResult(
-                username, CheckStatus.ERROR, f"step1_redirect_{sc}"
+                username, CheckStatus.ERROR, f"redirect_{sc}"
             )
 
-        # 404 / non-200 → profil topilmadi → Step 2 ga
+        # ── 404 → AVAILABLE ───────────────────────────────────────
         if sc == 404:
-            logger.info("[@%s] Step1: 404 -> Step 2 ga o'tish", username)
-            return None
+            logger.info("[@%s] AVAILABLE (HTTP 404)", username)
+            return CheckResult(
+                username, CheckStatus.AVAILABLE, "not_found_404"
+            )
 
-        # HTML kontentni tahlil qilish (faqat 200 uchun)
+        # ── 200: JSON yoki HTML tahlil ─────────────────────────────
+        if sc == 200:
+            return self._classify_200(username, resp)
+
+        # ── Boshqa status kodlar → ERROR ───────────────────────────
+        logger.warning("[@%s] Kutilmagan HTTP %d -> ERROR", username, sc)
+        return CheckResult(
+            username, CheckStatus.ERROR, f"unexpected_http_{sc}"
+        )
+
+    # ------------------------------------------------------------------
+    # HTTP 200 klassifikatsiya
+    # ------------------------------------------------------------------
+
+    def _classify_200(self, username: str, resp: Any) -> CheckResult:
+        """
+        HTTP 200 javobni klassifikatsiya qilish.
+
+        1) JSON + user data       → TAKEN (faol akkaunt)
+        2) HTML + profil meta      → TAKEN (faol akkaunt)
+        3) HTML + bo'sh qobiq      → TAKEN (banned/disabled)
+        4) HTML + "Page Not Found" → AVAILABLE
+        """
+        ul = username.lower()
+
+        # ── 1) JSON javobni tekshirish ─────────────────────────────
+        json_data = _try_parse_json(resp)
+
+        if json_data is not None:
+            user = _extract_user_from_json(json_data)
+            if user is not None:
+                ig_user = user.get("username", "")
+                logger.info(
+                    "[@%s] TAKEN (JSON: user=%s)", username, ig_user,
+                )
+                return CheckResult(
+                    username, CheckStatus.TAKEN, "profile_exists"
+                )
+
+            # JSON bor lekin user null/yo'q → banned/disabled
+            # (Instagram ba'zan JSON qaytaradi lekin user: null)
+            if "user" in str(json_data).lower():
+                logger.info(
+                    "[@%s] TAKEN (JSON: user key exists but null — banned/disabled)",
+                    username,
+                )
+                return CheckResult(
+                    username, CheckStatus.TAKEN, "account_disabled"
+                )
+
+        # ── 2) HTML javobni tekshirish ─────────────────────────────
         html = ""
         try:
             html = str(getattr(resp, "text", "") or "")
@@ -422,271 +463,86 @@ class InstagramChecker:
 
         html_lower = html.lower()
 
-        # Login sahifasi → ERROR
+        # Login page redirect (HTML ichida)
         if "/accounts/login/" in html_lower and len(html) < 5000:
-            logger.warning("[@%s] Step1: login sahifasi (HTML)", username)
+            logger.warning("[@%s] Login sahifasi (HTML)", username)
             return CheckResult(
-                username, CheckStatus.ERROR, "step1_login_page"
+                username, CheckStatus.ERROR, "login_page_html"
             )
 
-        if sc == 200:
-            title_m = _TITLE_RE.search(html)
-            title = (title_m.group(1).strip() if title_m else "").lower()
+        # <title> ni olish
+        title_m = _TITLE_RE.search(html)
+        title = (title_m.group(1).strip() if title_m else "").lower()
 
-            og_desc_m = _OG_DESC_RE.search(html)
-            og_desc = (og_desc_m.group(1).strip() if og_desc_m else "").lower()
+        # og:title
+        og_title_m = _OG_TITLE_RE.search(html)
+        og_title = (og_title_m.group(1).strip() if og_title_m else "")
 
-            ul = username.lower()
+        # og:description
+        og_desc_m = _OG_DESC_RE.search(html)
+        og_desc = (og_desc_m.group(1).strip() if og_desc_m else "").lower()
 
-            # "Page Not Found" / "Isn't Available" → profil yo'q → Step 2
-            is_not_found = any(
-                phrase in title or phrase in html_lower
-                for phrase in _NOT_FOUND_PHRASES
-            )
-            if is_not_found:
-                logger.info(
-                    "[@%s] Step1: 'Page Not Found' -> Step 2 ga o'tish",
-                    username,
-                )
-                return None
-
-            # Profil signallari: meta teglar bo'yicha TAKEN
-            has_meta_stats = "followers" in og_desc and "posts" in og_desc
-            has_profile_title = (
-                "photos and videos" in html_lower
-                or f"(@{ul})" in title
-            )
-
-            if has_meta_stats or has_profile_title:
-                logger.info(
-                    "[@%s] TAKEN (profile_exists) [Step 1] | meta=%s title=%s",
-                    username, has_meta_stats, has_profile_title,
-                )
-                return CheckResult(
-                    username, CheckStatus.TAKEN, "profile_exists"
-                )
-
-            # 200 lekin profil signallari yo'q → Step 2 ga
+        # ── "Page Not Found" → AVAILABLE ───────────────────────────
+        not_found_phrases = (
+            "page not found",
+            "the link you followed may be broken",
+        )
+        if any(p in title for p in not_found_phrases):
             logger.info(
-                "[@%s] Step1: 200, no profile signals -> Step 2 ga o'tish | title=%s",
+                "[@%s] AVAILABLE (HTTP 200 + 'Page Not Found' in title)",
+                username,
+            )
+            return CheckResult(
+                username, CheckStatus.AVAILABLE, "page_not_found_200"
+            )
+
+        # ── Profil signallari → TAKEN ──────────────────────────────
+        # og:title bo'sh bo'lmasa (haqiqiy ism/nom bor)
+        has_og_title = bool(og_title)
+
+        # og:description ichida followers VA posts
+        has_meta_stats = "followers" in og_desc and "posts" in og_desc
+
+        # title ichida (@username)
+        has_at_username = f"(@{ul})" in title
+
+        # "photos and videos" — profil sahifasi belgisi
+        has_photos_videos = "photos and videos" in html_lower
+
+        if has_og_title or has_meta_stats or has_at_username or has_photos_videos:
+            logger.info(
+                "[@%s] TAKEN (profile_exists) | og_title=%s meta_stats=%s (@user)=%s photos=%s",
+                username, bool(og_title), has_meta_stats,
+                has_at_username, has_photos_videos,
+            )
+            return CheckResult(
+                username, CheckStatus.TAKEN, "profile_exists"
+            )
+
+        # ── 200 + hech qanday profil belgisi yo'q ─────────────────
+        # Title faqat "Instagram" yoki bo'sh → BAN / DEACTIVATED
+        # Bu nom AVAILABLE EMAS — akkaunt disabled/banned!
+        is_bare_shell = (
+            title in ("instagram", "instagram • photos and videos", "")
+            or (not has_og_title and not has_meta_stats)
+        )
+
+        if is_bare_shell:
+            logger.info(
+                "[@%s] TAKEN (account_disabled — 200 but bare shell) | title=%s",
                 username, title[:60],
             )
-            return None
-
-        # Boshqa status kodlar → Step 2 ga o'tish
-        logger.info(
-            "[@%s] Step1: HTTP %d (noaniq) -> Step 2 ga o'tish", username, sc,
-        )
-        return None
-
-    # ------------------------------------------------------------------
-    # Step 2 — Password Recovery AJAX (aniq AVAILABLE / TAKEN)
-    # ------------------------------------------------------------------
-
-    async def _step2_recovery_check(
-        self, username: str
-    ) -> CheckResult:
-        """
-        POST /api/v1/web/accounts/account_recovery_send_ajax/
-        via curl_cffi (Chrome TLS fingerprint).
-
-        Parol tiklash endpointi — ban/deactivated/bo'sh nomlarni aniq ajratadi:
-          "No users found" / "user_not_found"  → AVAILABLE
-          HTTP 200 / email_sent / sms_sent /
-          checkpoint / feedback_required       → TAKEN
-          429                                  → ERROR
-        """
-        session_kwargs: dict[str, Any] = {
-            "impersonate": _IMPERSONATE,
-            "timeout": _API_TIMEOUT,
-            "verify": False,
-        }
-        if self._proxy:
-            session_kwargs["proxy"] = self._proxy
-
-        max_proxy_retries = 2
-        resp = None
-
-        for proxy_attempt in range(1, max_proxy_retries + 1):
-            try:
-                async with AsyncSession(**session_kwargs) as session:
-                    resp = await session.post(
-                        _RECOVERY_URL,
-                        headers=_RECOVERY_HEADERS,
-                        data=f"email_or_username={username}",
-                    )
-                break
-
-            except _CURL_NETWORK_EXCEPTIONS as exc:
-                if proxy_attempt < max_proxy_retries:
-                    logger.warning(
-                        "[@%s] Step2 proksi xato (%d/%d), %gs kutib qayta: %s",
-                        username, proxy_attempt, max_proxy_retries,
-                        _PROXY_RETRY_DELAY, exc,
-                    )
-                    await asyncio.sleep(_PROXY_RETRY_DELAY)
-                    continue
-                logger.warning(
-                    "[@%s] Step2 network xato (barcha urinishlar): %s",
-                    username, exc,
-                )
-                return CheckResult(
-                    username, CheckStatus.ERROR,
-                    f"step2_network_{type(exc).__name__}",
-                )
-
-            except Exception as exc:
-                if proxy_attempt < max_proxy_retries:
-                    logger.warning(
-                        "[@%s] Step2 kutilmagan xato (%d/%d): %s",
-                        username, proxy_attempt, max_proxy_retries, exc,
-                    )
-                    await asyncio.sleep(_PROXY_RETRY_DELAY)
-                    continue
-                logger.warning(
-                    "[@%s] Step2 kutilmagan (barcha): %s", username, exc,
-                )
-                return CheckResult(
-                    username, CheckStatus.ERROR,
-                    f"step2_unexpected_{type(exc).__name__}",
-                )
-
-        if resp is None:
             return CheckResult(
-                username, CheckStatus.ERROR, "step2_all_retries_failed"
+                username, CheckStatus.TAKEN, "account_disabled"
             )
 
-        sc = int(getattr(resp, "status_code", 0) or 0)
-
-        # 429 → ERROR
-        if sc == 429:
-            logger.warning("[@%s] Step2: 429 (rate limited)", username)
-            return CheckResult(username, CheckStatus.ERROR, "step2_429")
-
-        # Redirect → ERROR
-        if sc in (301, 302, 303, 307, 308):
-            location = ""
-            try:
-                location = str(
-                    getattr(resp, "headers", {}).get("location", "")
-                )
-            except Exception:
-                pass
-            logger.warning(
-                "[@%s] Step2: redirect (%d) -> %s",
-                username, sc, location[:100],
-            )
-            return CheckResult(
-                username, CheckStatus.ERROR, f"step2_redirect_{sc}"
-            )
-
-        # Response body text
-        body_text = ""
-        try:
-            body_text = str(getattr(resp, "text", "") or "")
-        except Exception:
-            pass
-        body_lower = body_text.lower()
-
-        # ── AVAILABLE: "No users found" yoki "user_not_found" ──────
-        if "no users found" in body_lower or "user_not_found" in body_lower:
-            logger.info(
-                "[@%s] AVAILABLE (recovery: no users found) [Step 2]",
-                username,
-            )
-            return CheckResult(
-                username, CheckStatus.AVAILABLE, "truly_available"
-            )
-
-        # JSON parse
-        data = _safe_json_curl(resp)
-
-        if data is None:
-            body_preview = body_text[:200] if body_text else "(empty)"
-            logger.warning(
-                "[@%s] Step2: non-JSON (HTTP %d) | body=%s",
-                username, sc, body_preview,
-            )
-            if "/accounts/login/" in body_lower or "login" in body_lower:
-                return CheckResult(
-                    username, CheckStatus.ERROR, "step2_login_page"
-                )
-            return CheckResult(
-                username, CheckStatus.ERROR, f"step2_non_json_{sc}"
-            )
-
-        logger.debug(
-            "[@%s] Step2 response: HTTP %d | %s",
-            username, sc, json.dumps(data, ensure_ascii=False)[:300],
-        )
-
-        # ── TAKEN: akkaunt mavjud belgilari ────────────────────────
-        # email_sent, sms_sent → parol tiklash yuborildi (akkaunt bor)
-        # checkpoint_required, feedback_required → akkaunt bor, lekin cheklangan
-        taken_signals = ("email_sent", "sms_sent", "obfuscated_login")
-        for key in taken_signals:
-            if data.get(key):
-                logger.info(
-                    "[@%s] TAKEN (recovery: %s) [Step 2]", username, key,
-                )
-                return CheckResult(
-                    username, CheckStatus.TAKEN, "account_exists"
-                )
-
-        # status=ok → akkaunt mavjud (recovery jarayoni boshlandi)
-        if sc == 200 and data.get("status") == "ok":
-            logger.info(
-                "[@%s] TAKEN (recovery: status=ok, HTTP 200) [Step 2]",
-                username,
-            )
-            return CheckResult(
-                username, CheckStatus.TAKEN, "account_exists"
-            )
-
-        # checkpoint_required / feedback_required → akkaunt mavjud
-        error_type = str(data.get("error_type", ""))
-        if error_type in (
-            "checkpoint_required", "checkpoint_challenge_required",
-            "feedback_required",
-        ):
-            logger.info(
-                "[@%s] TAKEN (recovery: %s) [Step 2]", username, error_type,
-            )
-            return CheckResult(
-                username, CheckStatus.TAKEN, "account_exists_restricted"
-            )
-
-        # ── Rate limit / IP block → ERROR ──────────────────────────
-        if data.get("status") == "fail":
-            message = str(data.get("message", ""))
-            msg_lower = message.lower()
-
-            if any(w in msg_lower for w in ("wait", "try again", "rate", "few minutes")):
-                logger.warning(
-                    "[@%s] Step2 rate limit: %s", username, message[:80],
-                )
-                return CheckResult(
-                    username, CheckStatus.ERROR, "step2_rate_limit"
-                )
-
-            if error_type in (
-                "spam", "rate_limit_error", "sentry_block",
-                "generic_request_error", "ip_block",
-            ):
-                logger.warning(
-                    "[@%s] Step2 infra block: %s", username, error_type,
-                )
-                return CheckResult(
-                    username, CheckStatus.ERROR, f"step2_block_{error_type}"
-                )
-
-        # ── Noaniq → ERROR ─────────────────────────────────────────
+        # ── Fallback: noaniq 200 → TAKEN (xavfsiz tomondan) ───────
         logger.warning(
-            "[@%s] Step2: noaniq javob -> ERROR | HTTP %d | body=%s",
-            username, sc, str(data)[:200],
+            "[@%s] TAKEN (200 noaniq — xavfsiz tomondan) | title=%s | html_len=%d",
+            username, title[:60], len(html),
         )
         return CheckResult(
-            username, CheckStatus.ERROR, f"step2_unknown_{sc}"
+            username, CheckStatus.TAKEN, "ambiguous_200_safe"
         )
 
 
