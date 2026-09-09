@@ -62,21 +62,11 @@ _ANDROID_USER_AGENT = (
     "(33/13; 420dpi; 1080x2400; Xiaomi; M2101K6G; sweet; qcom; en_US; 555627230)"
 )
 _IG_APP_ID = "936619743392459"
+_X_MID = "Y5Z_rwABAAFYq6G3Vq7x3f0vXf2j"
 
 # HMAC-SHA256 signing key (Instagram Android client key)
 _IG_SIG_KEY = b"6f9d2207da762a7924e81561f324838ae43fb067"
 _IG_SIG_KEY_VERSION = "4"
-
-_ANDROID_HEADERS: dict[str, str] = {
-    "User-Agent": _ANDROID_USER_AGENT,
-    "X-IG-App-ID": _IG_APP_ID,
-    "Accept-Language": "en-US",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "X-FB-HTTP-Engine": "Liger",
-    "X-IG-Connection-Type": "WIFI",
-    "X-IG-Capabilities": "3brTvx0=",
-    "Accept-Encoding": "gzip, deflate",
-}
 
 # Network exceptions
 _HTTPX_NETWORK_EXCEPTIONS = (
@@ -341,6 +331,7 @@ class InstagramChecker:
                 "timeout": _PROFILE_TIMEOUT,
                 "follow_redirects": True,
                 "http2": False,
+                "verify": False,
             }
             if self._proxy:
                 kw["proxy"] = self._proxy
@@ -422,10 +413,23 @@ class InstagramChecker:
           429 / network                    -> ERROR
           HECH QACHON fallback AVAILABLE yo'q!
         """
-        # Build signed payload
+        # Build per-request device identifiers
         device_id = _generate_device_id()
+        phone_id = _generate_uuid()
         guid = _generate_uuid()
         waterfall_id = _generate_uuid()
+
+        # Dynamic headers — har so'rovda yangi device ID bilan
+        lookup_headers: dict[str, str] = {
+            "User-Agent": _ANDROID_USER_AGENT,
+            "X-IG-App-ID": _IG_APP_ID,
+            "X-IG-Device-ID": guid,
+            "X-IG-Android-ID": device_id,
+            "X-MID": _X_MID,
+            "Accept-Language": "en-US",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "X-FB-HTTP-Engine": "Liger",
+        }
 
         payload = {
             "_csrftoken": "missing",
@@ -433,6 +437,7 @@ class InstagramChecker:
             "device_id": device_id,
             "guid": guid,
             "waterfall_id": waterfall_id,
+            "directly_sign_in": "false",
         }
         signed_body = _sign_request_body(payload)
 
@@ -441,6 +446,7 @@ class InstagramChecker:
                 "timeout": _ANDROID_API_TIMEOUT,
                 "follow_redirects": False,
                 "http2": False,
+                "verify": False,
             }
             if self._proxy:
                 kw["proxy"] = self._proxy
@@ -448,7 +454,7 @@ class InstagramChecker:
             async with httpx.AsyncClient(**kw) as client:
                 resp = await client.post(
                     _ANDROID_LOOKUP_URL,
-                    headers=_ANDROID_HEADERS,
+                    headers=lookup_headers,
                     content=signed_body,
                 )
         except _HTTPX_NETWORK_EXCEPTIONS as exc:
