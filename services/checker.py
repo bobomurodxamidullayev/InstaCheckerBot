@@ -1,43 +1,37 @@
-"""Instagram username availability checker — Authenticated Session Pipeline.
+"""Instagram username availability checker — Android Private API Pipeline.
 
 Architecture:
   Tier 1  — Regex / syntax / reserved pre-validation (no network).
-  Tier 2  — Three-phase Instagram check:
+  Tier 2  — Two-phase Instagram check:
              Phase A: Profile page GET (httpx, bot UA) — fast.
                       Detects existing profiles instantly as TAKEN.
-             Phase B: Authenticated web_profile_info GET (curl_cffi + session cookie).
-                      Confirms user existence in Instagram DB.
-             Phase C: Authenticated check_username POST (curl_cffi + session cookie).
-                      FAQAT ``available: true`` = AVAILABLE. Boshqa hamma narsa TAKEN.
+             Phase B: Android Private API check_username POST (httpx, HMAC signed).
+                      Confirms username availability via Instagram's official
+                      mobile signup endpoint. No account/session required.
 
 QATIY QOIDALAR:
-  AVAILABLE — FAQAT Phase C ``available: true`` qaytarganda.
+  AVAILABLE — FAQAT Phase B ``available: true`` qaytarganda.
   TAKEN     — Profil mavjud, banned, deactivated, cooldown, spam — barchasi TAKEN.
-  ERROR     — Faqat infra muammo (network/proxy/429/checkpoint).
+  ERROR     — Faqat infra muammo (network/proxy/429).
   FALLBACK TAQIQLANADI — "profil topilmadi" hech qachon AVAILABLE emas!
+
+ANONIM REJIM: Hech qanday Instagram akkaunt yoki session cookie talab etilmaydi.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import random
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
+from urllib.parse import quote
 
 import httpx
-
-from curl_cffi import CurlError
-from curl_cffi.requests import AsyncSession
-
-try:
-    from curl_cffi.requests.exceptions import RequestException as CurlRequestException
-except ImportError:
-    try:
-        from curl_cffi.requests.errors import RequestsError as CurlRequestException  # type: ignore
-    except ImportError:
-        CurlRequestException = CurlError  # type: ignore
 
 from config import settings
 from models.username_log import CheckStatus
@@ -59,21 +53,30 @@ _BOT_HEADERS: dict[str, str] = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Phase B & C — Authenticated API (curl_cffi + session)
-_WEB_PROFILE_URL_TPL = (
-    "https://www.instagram.com/api/v1/users/web_profile_info/?username={}"
-)
-_CHECK_USERNAME_URL = (
-    "https://www.instagram.com/api/v1/users/check_username/"
-)
-_API_TIMEOUT = 12.0
-_IMPERSONATE = "chrome124"
+# Phase B — Android Private API (no auth, HMAC signed)
+_ANDROID_CHECK_USERNAME_URL = "https://i.instagram.com/api/v1/users/check_username/"
+_ANDROID_API_TIMEOUT = 12.0
 
-_CHROME_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+_ANDROID_USER_AGENT = (
+    "Instagram 315.0.0.33.109 Android "
+    "(33/13; 420dpi; 1080x2400; Xiaomi; M2101K6G; sweet; qcom; en_US; 555627230)"
 )
 _IG_APP_ID = "936619743392459"
+
+# HMAC-SHA256 signing key (Instagram Android client key)
+_IG_SIG_KEY = b"6f9d2207da762a7924e81561f324838ae43fb067"
+_IG_SIG_KEY_VERSION = "4"
+
+_ANDROID_HEADERS: dict[str, str] = {
+    "User-Agent": _ANDROID_USER_AGENT,
+    "X-IG-App-ID": _IG_APP_ID,
+    "Accept-Language": "en-US",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "X-FB-HTTP-Engine": "Liger",
+    "X-IG-Connection-Type": "WIFI",
+    "X-IG-Capabilities": "3brTvx0=",
+    "Accept-Encoding": "gzip, deflate",
+}
 
 # Network exceptions
 _HTTPX_NETWORK_EXCEPTIONS = (
@@ -82,13 +85,8 @@ _HTTPX_NETWORK_EXCEPTIONS = (
     httpx.TimeoutException, ConnectionError, OSError,
 )
 
-_CURL_NETWORK_EXCEPTIONS = (
-    CurlError, CurlRequestException, TimeoutError,
-    asyncio.TimeoutError, ConnectionError, OSError,
-)
-
 # Tier-1 pre-validation
-_INVALID_SYNTAX_RE = re.compile(r"^\.|\.\.|\.$|[^a-zA-Z0-9._]")
+_INVALID_SYNTAX_RE = re.compile(r"^\.|\.\.|\.$ |[^a-zA-Z0-9._]")
 _RESERVED_NAMES: frozenset[str] = frozenset({
     "admin", "instagram", "support", "help", "login", "signup",
     "accounts", "explore", "direct", "security", "about", "developer",
@@ -106,11 +104,6 @@ _NOT_FOUND_TITLES = frozenset({
     "sorry, this page isn't available.", "content unavailable",
 })
 
-# Infra block kodlari
-_INFRA_ERROR_TYPES: frozenset[str] = frozenset({
-    "checkpoint_required", "checkpoint_challenge_required",
-    "spam", "rate_limit_error", "generic_request_error", "sentry_block",
-})
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -141,19 +134,41 @@ class CheckResult:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _safe_json(resp: Any) -> dict[str, Any] | None:
-    """Safely parse JSON dict from response."""
+def _generate_device_id() -> str:
+    """Random Android device ID."""
+    return f"android-{uuid.uuid4().hex[:16]}"
+
+
+def _generate_uuid() -> str:
+    """Random UUID for request."""
+    return str(uuid.uuid4())
+
+
+def _sign_request_body(payload_dict: dict[str, Any]) -> str:
+    """
+    Instagram Android API uchun HMAC-SHA256 imzolangan so'rov tanasi.
+
+    Format: signed_body=SIGNATURE.{json_payload}&ig_sig_key_version=4
+    """
+    raw_json = json.dumps(payload_dict, separators=(",", ":"))
+    signature = hmac.new(
+        _IG_SIG_KEY, raw_json.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+    # URL-encode the JSON payload for form body
+    encoded_json = quote(raw_json, safe="")
+    return f"signed_body={signature}.{encoded_json}&ig_sig_key_version={_IG_SIG_KEY_VERSION}"
+
+
+def _safe_json(resp: httpx.Response) -> dict[str, Any] | None:
+    """Safely parse JSON dict from httpx response."""
     try:
         data = resp.json()
         if isinstance(data, dict):
             return data
     except Exception:
         pass
-    content = getattr(resp, "content", b"")
-    if isinstance(content, (bytes, bytearray)):
-        text = bytes(content).decode("utf-8", errors="ignore").strip()
-    else:
-        text = str(getattr(resp, "text", "") or "").strip()
+    text = resp.text or ""
+    text = text.strip()
     if not text or text[0] != "{":
         return None
     try:
@@ -169,12 +184,15 @@ def _safe_json(resp: Any) -> dict[str, Any] | None:
 
 class InstagramChecker:
     """
-    Authenticated Instagram username availability checker.
+    Anonim Instagram username availability checker — Android Private API.
+
+    Hech qanday Instagram akkaunt yoki session cookie talab etilmaydi.
+    HMAC-SHA256 imzolangan Android Mobile API orqali tekshiriladi.
 
     QATIY QOIDALAR:
       AVAILABLE — FAQAT check_username ``available: true`` qaytarganda.
       TAKEN     — Profil mavjud, banned, deactivated, cooldown, spam.
-      ERROR     — Network/proxy/429/checkpoint infra muammo.
+      ERROR     — Network/proxy/429 infra muammo.
       FALLBACK TAQIQLANADI — "profil topilmadi" != AVAILABLE!
     """
 
@@ -184,49 +202,18 @@ class InstagramChecker:
         )
         self._in_flight: set[str] = set()
 
-        # Session cookie'larni yuklash
-        self._session_id = settings.ig_session_id
-        self._ds_user_id = settings.ig_ds_user_id
-        self._csrf_token = settings.ig_csrf_token
-        self._mid = settings.ig_mid
-        self._ig_did = settings.ig_did
-
-        has_session = bool(self._session_id and self._csrf_token)
         logger.info(
-            "InstagramChecker ready | proxy=%s | session=%s",
-            bool(self._proxy), has_session,
+            "InstagramChecker ready (Android Private API) | proxy=%s | mode=anonymous",
+            bool(self._proxy),
         )
-
-    # ------------------------------------------------------------------
-    # Session cookie string
-    # ------------------------------------------------------------------
-
-    def _cookie_header(self) -> str:
-        """Instagram session cookie'larini bitta Cookie header qilib beradi."""
-        parts = [
-            f"sessionid={self._session_id}",
-            f"ds_user_id={self._ds_user_id}",
-            f"csrftoken={self._csrf_token}",
-        ]
-        if self._mid:
-            parts.append(f"mid={self._mid}")
-        if self._ig_did:
-            parts.append(f"ig_did={self._ig_did}")
-        return "; ".join(parts)
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        has_session = bool(self._session_id and self._csrf_token)
-        if not has_session:
-            logger.warning(
-                "Instagram session cookie'lar sozlanmagan! "
-                ".env ga IG_SESSION_ID va IG_CSRF_TOKEN qo'shing."
-            )
         logger.info(
-            "InstagramChecker started (authenticated=%s)", has_session,
+            "InstagramChecker started (Android Private API, no session needed)"
         )
 
     async def stop(self) -> None:
@@ -318,16 +305,14 @@ class InstagramChecker:
         return None
 
     # ------------------------------------------------------------------
-    # Tier 2 — Phase A -> Phase B -> Phase C
+    # Tier 2 — Phase A -> Phase B
     # ------------------------------------------------------------------
 
     async def _tier2_check(self, username: str) -> CheckResult:
         """
         Phase A: Profil sahifasi -> TAKEN (agar profil mavjud).
-        Phase B: web_profile_info (authenticated) -> TAKEN (agar user mavjud).
-        Phase C: check_username (authenticated) -> AVAILABLE / TAKEN.
+        Phase B: Android Private API check_username -> AVAILABLE / TAKEN.
 
-        Phase B 429/ERROR bo'lsa -> Phase C ga o'tadi (to'xtamaydi!).
         HECH QACHON fallback AVAILABLE yo'q!
         """
         # Phase A — profil sahifasi
@@ -335,22 +320,9 @@ class InstagramChecker:
         if phase_a is not None:
             return phase_a
 
-        # Phase A: profil topilmadi -> Phase B: authenticated API
+        # Phase A: profil topilmadi -> Phase B: Android API
         await asyncio.sleep(random.uniform(0.3, 0.8))
-        phase_b = await self._phase_b_web_profile_info(username)
-        if phase_b is not None:
-            # Phase B aniq javob (TAKEN/AVAILABLE) berdi -> ishlatamiz
-            if phase_b.status != CheckStatus.ERROR:
-                return phase_b
-            # Phase B ERROR (429/network) -> Phase C ga o'tamiz
-            logger.info(
-                "[@%s] Phase B xato (%s) -> Phase C ga o'tilmoqda",
-                username, phase_b.error_message,
-            )
-
-        # Phase C: check_username (YAKUNIY QAROR)
-        await asyncio.sleep(random.uniform(0.3, 0.8))
-        return await self._phase_c_check_username(username)
+        return await self._phase_b_android_check_username(username)
 
     # ------------------------------------------------------------------
     # Phase A — Profile page (httpx, bot UA, NO AUTH)
@@ -417,12 +389,12 @@ class InstagramChecker:
             or "content unavailable" in title
         )
         if not_found:
-            logger.info("[@%s] Profil topilmadi -> Phase B", username)
+            logger.info("[@%s] Profil topilmadi -> Phase B (Android API)", username)
             return None
 
         # Login page?
         if "login" in title:
-            logger.info("[@%s] Login sahifasi -> Phase B", username)
+            logger.info("[@%s] Login sahifasi -> Phase B (Android API)", username)
             return None
 
         # Username in body with substantial HTML?
@@ -430,242 +402,171 @@ class InstagramChecker:
             logger.info("[@%s] TAKEN (username_in_body) [Phase A]", username)
             return CheckResult(username, CheckStatus.TAKEN, "profile_exists")
 
-        logger.info("[@%s] Noaniq -> Phase B | title=%s", username, title[:50])
+        logger.info("[@%s] Noaniq -> Phase B (Android API) | title=%s", username, title[:50])
         return None
 
     # ------------------------------------------------------------------
-    # Phase B — web_profile_info (curl_cffi, AUTHENTICATED)
+    # Phase B — Android Private API check_username (HMAC signed, NO AUTH)
     # ------------------------------------------------------------------
 
-    async def _phase_b_web_profile_info(
+    async def _phase_b_android_check_username(
         self, username: str
-    ) -> CheckResult | None:
+    ) -> CheckResult:
         """
-        GET web_profile_info bilan Instagram DB dan user tekshirish.
-        Session cookie bilan autentifikatsiya.
-
-        Returns:
-          TAKEN     — agar user.data mavjud (profil DB da bor).
-          None      — agar user null (profil DB da yo'q) -> Phase C ga o'tish.
-          ERROR     — agar network/429/checkpoint.
-        """
-        url = _WEB_PROFILE_URL_TPL.format(username)
-
-        session_kwargs: dict[str, Any] = {
-            "impersonate": _IMPERSONATE,
-            "timeout": _API_TIMEOUT,
-        }
-        if self._proxy:
-            session_kwargs["proxy"] = self._proxy
-
-        headers = {
-            "User-Agent": _CHROME_USER_AGENT,
-            "X-IG-App-ID": _IG_APP_ID,
-            "X-CSRFToken": self._csrf_token,
-            "X-Requested-With": "XMLHttpRequest",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": f"https://www.instagram.com/{username}/",
-            "Cookie": self._cookie_header(),
-        }
-
-        try:
-            async with AsyncSession(**session_kwargs) as session:
-                resp = await session.get(url, headers=headers)
-        except _CURL_NETWORK_EXCEPTIONS as exc:
-            detail = f"wpi_network_{type(exc).__name__}"
-            logger.warning("[@%s] web_profile_info xato: %s", username, exc)
-            return CheckResult(username, CheckStatus.ERROR, detail)
-        except Exception as exc:
-            detail = f"wpi_unexpected_{type(exc).__name__}"
-            logger.warning("[@%s] web_profile_info kutilmagan: %s", username, exc)
-            return CheckResult(username, CheckStatus.ERROR, detail)
-
-        sc = int(getattr(resp, "status_code", 0) or 0)
-
-        if sc == 429:
-            logger.warning("[@%s] web_profile_info 429", username)
-            return CheckResult(username, CheckStatus.ERROR, "wpi_429")
-
-        # 404 -> user DB da yo'q -> Phase C ga o'tish
-        if sc == 404:
-            logger.info("[@%s] web_profile_info 404 -> Phase C", username)
-            return None
-
-        data = _safe_json(resp)
-        if data is None:
-            logger.warning("[@%s] web_profile_info non-JSON (HTTP %d)", username, sc)
-            return CheckResult(username, CheckStatus.ERROR, f"wpi_non_json_{sc}")
-
-        # Checkpoint / infra block?
-        infra = self._check_infra_block(username, data, "wpi")
-        if infra is not None:
-            return infra
-
-        # User data mavjud?
-        user_data = None
-        if isinstance(data.get("data"), dict):
-            user_data = data["data"].get("user")
-        elif "user" in data:
-            user_data = data.get("user")
-
-        if user_data and isinstance(user_data, dict):
-            logger.info("[@%s] TAKEN (user found in DB) [Phase B]", username)
-            return CheckResult(username, CheckStatus.TAKEN, "profile_exists")
-
-        # User null -> profil DB da yo'q -> Phase C ga o'tish
-        if user_data is None and data.get("status") == "ok":
-            logger.info("[@%s] User null -> Phase C (check_username)", username)
-            return None
-
-        # status: fail
-        if data.get("status") == "fail":
-            msg = str(data.get("message", ""))
-            msg_lower = msg.lower()
-            # Rate limit?
-            if "wait" in msg_lower or "try again" in msg_lower:
-                logger.warning("[@%s] web_profile_info rate limit: %s", username, msg[:60])
-                return CheckResult(username, CheckStatus.ERROR, "wpi_rate_limit")
-            # Boshqa fail -> user topilmadi -> Phase C
-            logger.info("[@%s] web_profile_info fail -> Phase C | %s", username, msg[:60])
-            return None
-
-        # Noaniq -> Phase C
-        logger.info("[@%s] web_profile_info noaniq -> Phase C", username)
-        return None
-
-    # ------------------------------------------------------------------
-    # Phase C — check_username (curl_cffi, AUTHENTICATED)
-    # ------------------------------------------------------------------
-
-    async def _phase_c_check_username(self, username: str) -> CheckResult:
-        """
-        POST check_username bilan username ro'yxatdan o'tish mumkinligini tekshirish.
-        Session cookie bilan autentifikatsiya.
+        POST check_username via Instagram Android Private API.
+        HMAC-SHA256 signed body, no session/cookie required.
 
         QATIY:
           available: true  -> AVAILABLE (YAGONA yo'l!)
           available: false -> TAKEN
-          status: fail     -> TAKEN (banned/deleted/cooldown/spam)
+          error_type: username_held_by_someone_else -> TAKEN
+          error_type: signup_block -> TAKEN
+          status: fail     -> TAKEN
           429 / network    -> ERROR
           HECH QACHON fallback AVAILABLE yo'q!
         """
-        session_kwargs: dict[str, Any] = {
-            "impersonate": _IMPERSONATE,
-            "timeout": _API_TIMEOUT,
-        }
-        if self._proxy:
-            session_kwargs["proxy"] = self._proxy
+        # Build signed payload
+        device_id = _generate_device_id()
+        guid = _generate_uuid()
 
-        headers = {
-            "User-Agent": _CHROME_USER_AGENT,
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "X-IG-App-ID": _IG_APP_ID,
-            "X-CSRFToken": self._csrf_token,
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": "https://www.instagram.com/",
-            "Cookie": self._cookie_header(),
+        payload = {
+            "_csrftoken": "missing",
+            "username": username,
+            "device_id": device_id,
+            "guid": guid,
         }
+        signed_body = _sign_request_body(payload)
 
         try:
-            async with AsyncSession(**session_kwargs) as session:
-                resp = await session.post(
-                    _CHECK_USERNAME_URL,
-                    headers=headers,
-                    data={"username": username},
+            kw: dict[str, Any] = {
+                "timeout": _ANDROID_API_TIMEOUT,
+                "follow_redirects": False,
+                "http2": False,
+            }
+            if self._proxy:
+                kw["proxy"] = self._proxy
+
+            async with httpx.AsyncClient(**kw) as client:
+                resp = await client.post(
+                    _ANDROID_CHECK_USERNAME_URL,
+                    headers=_ANDROID_HEADERS,
+                    content=signed_body,
                 )
-        except _CURL_NETWORK_EXCEPTIONS as exc:
-            detail = f"cu_network_{type(exc).__name__}"
-            logger.warning("[@%s] check_username xato: %s", username, exc)
+        except _HTTPX_NETWORK_EXCEPTIONS as exc:
+            detail = f"android_network_{type(exc).__name__}"
+            logger.warning("[@%s] Android API xato: %s", username, exc)
             return CheckResult(username, CheckStatus.ERROR, detail)
         except Exception as exc:
-            detail = f"cu_unexpected_{type(exc).__name__}"
-            logger.warning("[@%s] check_username kutilmagan: %s", username, exc)
+            detail = f"android_unexpected_{type(exc).__name__}"
+            logger.warning("[@%s] Android API kutilmagan: %s", username, exc)
             return CheckResult(username, CheckStatus.ERROR, detail)
 
-        sc = int(getattr(resp, "status_code", 0) or 0)
+        sc = resp.status_code
 
         # 429 -> ERROR
         if sc == 429:
-            logger.warning("[@%s] check_username 429", username)
-            return CheckResult(username, CheckStatus.ERROR, "cu_429")
+            logger.warning("[@%s] Android API 429 (rate limited)", username)
+            return CheckResult(username, CheckStatus.ERROR, "android_429")
 
         data = _safe_json(resp)
         if data is None:
-            logger.warning("[@%s] check_username non-JSON (HTTP %d)", username, sc)
-            return CheckResult(username, CheckStatus.ERROR, f"cu_non_json_{sc}")
+            logger.warning(
+                "[@%s] Android API non-JSON (HTTP %d) | body=%s",
+                username, sc, (resp.text or "")[:200],
+            )
+            return CheckResult(
+                username, CheckStatus.ERROR, f"android_non_json_{sc}"
+            )
 
-        # Infra block?
-        infra = self._check_infra_block(username, data, "cu")
-        if infra is not None:
-            return infra
+        logger.debug(
+            "[@%s] Android API response: HTTP %d | %s",
+            username, sc, json.dumps(data, ensure_ascii=False)[:300],
+        )
 
-        # ── AVAILABLE: FAQAT available == True ─────────────────────
-        if data.get("available") is True:
-            logger.info("[@%s] AVAILABLE (check_username: available=true)", username)
-            return CheckResult(username, CheckStatus.AVAILABLE, "truly_available")
+        # ── AVAILABLE: FAQAT available == True va status == "ok" ───
+        if data.get("available") is True and data.get("status") == "ok":
+            logger.info(
+                "[@%s] AVAILABLE (Android API: available=true, status=ok)",
+                username,
+            )
+            return CheckResult(
+                username, CheckStatus.AVAILABLE, "truly_available"
+            )
 
         # ── TAKEN: available == False ──────────────────────────────
         if data.get("available") is False:
-            error_msg = str(
-                data.get("error", data.get("error_type", "username_is_taken"))
+            error_type = str(
+                data.get("error_type", data.get("error", "username_is_taken"))
             )
-            logger.info("[@%s] TAKEN (available=false, %s) [Phase C]", username, error_msg)
-            return CheckResult(username, CheckStatus.TAKEN, error_msg)
+            logger.info(
+                "[@%s] TAKEN (available=false, %s) [Phase B]",
+                username, error_type,
+            )
+            return CheckResult(username, CheckStatus.TAKEN, error_type)
 
-        # ── TAKEN / ERROR: status == fail ──────────────────────────
+        # ── TAKEN: error_type signals ─────────────────────────────
+        error_type = str(data.get("error_type", ""))
+        if error_type in (
+            "username_held_by_someone_else",
+            "signup_block",
+            "username_is_taken",
+        ):
+            logger.info(
+                "[@%s] TAKEN (error_type=%s) [Phase B]", username, error_type,
+            )
+            return CheckResult(username, CheckStatus.TAKEN, error_type)
+
+        # ── TAKEN: status == "fail" ────────────────────────────────
         if data.get("status") == "fail":
-            error_type = str(data.get("error_type", "unknown"))
+            error_type = str(data.get("error_type", "unknown_fail"))
             message = str(data.get("message", ""))
             msg_lower = message.lower()
+
             # Rate limit?
             if "wait" in msg_lower or "try again" in msg_lower:
-                logger.warning("[@%s] check_username rate limit: %s", username, message[:60])
-                return CheckResult(username, CheckStatus.ERROR, "cu_rate_limit")
+                logger.warning(
+                    "[@%s] Android API rate limit: %s", username, message[:80],
+                )
+                return CheckResult(
+                    username, CheckStatus.ERROR, "android_rate_limit"
+                )
+
+            # Checkpoint / spam block?
+            if error_type in (
+                "checkpoint_required", "checkpoint_challenge_required",
+                "spam", "rate_limit_error", "sentry_block",
+                "generic_request_error",
+            ):
+                logger.warning(
+                    "[@%s] Android API infra block: %s", username, error_type,
+                )
+                return CheckResult(
+                    username, CheckStatus.ERROR, f"android_block_{error_type}"
+                )
+
             # Boshqa fail -> TAKEN (banned/deleted/cooldown)
-            logger.info("[@%s] TAKEN (status=fail, %s) [Phase C]", username, error_type)
-            return CheckResult(username, CheckStatus.TAKEN, f"fail_{error_type}")
+            logger.info(
+                "[@%s] TAKEN (status=fail, %s) [Phase B]",
+                username, error_type,
+            )
+            return CheckResult(
+                username, CheckStatus.TAKEN, f"fail_{error_type}"
+            )
 
         # ── username_suggestions -> TAKEN ──────────────────────────
         sug = data.get("username_suggestions")
         if isinstance(sug, list) and len(sug) > 0:
-            logger.info("[@%s] TAKEN (suggestions) [Phase C]", username)
+            logger.info("[@%s] TAKEN (suggestions) [Phase B]", username)
             return CheckResult(username, CheckStatus.TAKEN, "username_is_taken")
 
         # ── Noaniq -> ERROR (HECH QACHON AVAILABLE emas!) ─────────
         logger.warning(
-            "[@%s] Noaniq API javob -> ERROR | body=%s",
-            username, str(data)[:150],
+            "[@%s] Noaniq Android API javob -> ERROR | body=%s",
+            username, str(data)[:200],
         )
-        return CheckResult(username, CheckStatus.ERROR, "cu_unknown_response")
-
-    # ------------------------------------------------------------------
-    # Infra block detection
-    # ------------------------------------------------------------------
-
-    def _check_infra_block(
-        self, username: str, data: dict[str, Any], prefix: str
-    ) -> CheckResult | None:
-        """checkpoint/spam/sentry_block/feedback_required -> ERROR."""
-        # Spam / feedback_required (akkount vaqtincha bloklangan)
-        if data.get("spam") is True or data.get("message") == "feedback_required":
-            msg = str(data.get("feedback_message", data.get("message", "spam")))
-            logger.warning(
-                "[@%s] SPAM/FEEDBACK block: %s", username, msg[:80],
-            )
-            return CheckResult(username, CheckStatus.ERROR, f"{prefix}_spam_block")
-
-        if data.get("status") == "fail":
-            et = str(data.get("error_type", ""))
-            if et in _INFRA_ERROR_TYPES:
-                logger.warning("[@%s] IG block: %s", username, et)
-                return CheckResult(username, CheckStatus.ERROR, f"{prefix}_block_{et}")
-        if data.get("checkpoint_url") or data.get("lock"):
-            logger.warning("[@%s] Checkpoint detected", username)
-            return CheckResult(username, CheckStatus.ERROR, f"{prefix}_checkpoint")
-        return None
+        return CheckResult(
+            username, CheckStatus.ERROR, "android_unknown_response"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -10,8 +10,7 @@
 aiogram==3.13.1
 
 # ─── HTTP Client (Instagram so'rovlari uchun) ───────────────
-# curl_cffi: Chrome TLS fingerprint (SSL handshake / RST muammolariga)
-curl_cffi>=0.7.1
+# httpx: Phase A (profil GET) va Phase B (Android API POST) uchun
 httpx[socks]==0.27.2
 
 # ─── Database ───────────────────────────────────────────────
