@@ -51,6 +51,13 @@ class Settings(BaseSettings):
     concurrent_limit_direct: int = Field(default=1, ge=1, le=10)
     rate_limit_sleep: float = Field(default=30.0, ge=5.0)
 
+    # ─── Instagram Session ─────────────────────────────────────
+    ig_session_id: str = Field(default="")
+    ig_ds_user_id: str = Field(default="")
+    ig_csrf_token: str = Field(default="")
+    ig_mid: str = Field(default="")
+    ig_did: str = Field(default="")
+
     # ─── Generator ─────────────────────────────────────────────
     generator_charset: str = Field(default="alphanumeric")
     generator_default_count: int = Field(default=20, ge=1, le=100)
