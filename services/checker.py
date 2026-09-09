@@ -53,8 +53,8 @@ _BOT_HEADERS: dict[str, str] = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Phase B — Android Private API (no auth, HMAC signed)
-_ANDROID_CHECK_USERNAME_URL = "https://i.instagram.com/api/v1/users/check_username/"
+# Phase B — Android Private API Lookup (no auth, HMAC signed)
+_ANDROID_LOOKUP_URL = "https://i.instagram.com/api/v1/users/lookup/"
 _ANDROID_API_TIMEOUT = 12.0
 
 _ANDROID_USER_AGENT = (
@@ -322,7 +322,7 @@ class InstagramChecker:
 
         # Phase A: profil topilmadi -> Phase B: Android API
         await asyncio.sleep(random.uniform(0.3, 0.8))
-        return await self._phase_b_android_check_username(username)
+        return await self._phase_b_android_lookup(username)
 
     # ------------------------------------------------------------------
     # Phase A — Profile page (httpx, bot UA, NO AUTH)
@@ -406,34 +406,33 @@ class InstagramChecker:
         return None
 
     # ------------------------------------------------------------------
-    # Phase B — Android Private API check_username (HMAC signed, NO AUTH)
+    # Phase B — Android Private API users/lookup (HMAC signed, NO AUTH)
     # ------------------------------------------------------------------
 
-    async def _phase_b_android_check_username(
+    async def _phase_b_android_lookup(
         self, username: str
     ) -> CheckResult:
         """
-        POST check_username via Instagram Android Private API.
+        POST users/lookup/ via Instagram Android Private API.
         HMAC-SHA256 signed body, no session/cookie required.
 
         QATIY:
-          available: true  -> AVAILABLE (YAGONA yo'l!)
-          available: false -> TAKEN
-          error_type: username_held_by_someone_else -> TAKEN
-          error_type: signup_block -> TAKEN
-          status: fail     -> TAKEN
-          429 / network    -> ERROR
+          user mavjud / user_found: true   -> TAKEN
+          404 / "No users found" / user_found: false -> AVAILABLE
+          429 / network                    -> ERROR
           HECH QACHON fallback AVAILABLE yo'q!
         """
         # Build signed payload
         device_id = _generate_device_id()
         guid = _generate_uuid()
+        waterfall_id = _generate_uuid()
 
         payload = {
             "_csrftoken": "missing",
-            "username": username,
+            "q": username,
             "device_id": device_id,
             "guid": guid,
+            "waterfall_id": waterfall_id,
         }
         signed_body = _sign_request_body(payload)
 
@@ -448,87 +447,100 @@ class InstagramChecker:
 
             async with httpx.AsyncClient(**kw) as client:
                 resp = await client.post(
-                    _ANDROID_CHECK_USERNAME_URL,
+                    _ANDROID_LOOKUP_URL,
                     headers=_ANDROID_HEADERS,
                     content=signed_body,
                 )
         except _HTTPX_NETWORK_EXCEPTIONS as exc:
-            detail = f"android_network_{type(exc).__name__}"
-            logger.warning("[@%s] Android API xato: %s", username, exc)
+            detail = f"lookup_network_{type(exc).__name__}"
+            logger.warning("[@%s] Lookup API xato: %s", username, exc)
             return CheckResult(username, CheckStatus.ERROR, detail)
         except Exception as exc:
-            detail = f"android_unexpected_{type(exc).__name__}"
-            logger.warning("[@%s] Android API kutilmagan: %s", username, exc)
+            detail = f"lookup_unexpected_{type(exc).__name__}"
+            logger.warning("[@%s] Lookup API kutilmagan: %s", username, exc)
             return CheckResult(username, CheckStatus.ERROR, detail)
 
         sc = resp.status_code
 
         # 429 -> ERROR
         if sc == 429:
-            logger.warning("[@%s] Android API 429 (rate limited)", username)
-            return CheckResult(username, CheckStatus.ERROR, "android_429")
+            logger.warning("[@%s] Lookup API 429 (rate limited)", username)
+            return CheckResult(username, CheckStatus.ERROR, "lookup_429")
 
-        data = _safe_json(resp)
-        if data is None:
-            logger.warning(
-                "[@%s] Android API non-JSON (HTTP %d) | body=%s",
-                username, sc, (resp.text or "")[:200],
-            )
-            return CheckResult(
-                username, CheckStatus.ERROR, f"android_non_json_{sc}"
-            )
-
-        logger.debug(
-            "[@%s] Android API response: HTTP %d | %s",
-            username, sc, json.dumps(data, ensure_ascii=False)[:300],
-        )
-
-        # ── AVAILABLE: FAQAT available == True va status == "ok" ───
-        if data.get("available") is True and data.get("status") == "ok":
+        # 404 -> AVAILABLE (user topilmadi)
+        if sc == 404:
             logger.info(
-                "[@%s] AVAILABLE (Android API: available=true, status=ok)",
+                "[@%s] AVAILABLE (Lookup API: HTTP 404, user not found)",
                 username,
             )
             return CheckResult(
                 username, CheckStatus.AVAILABLE, "truly_available"
             )
 
-        # ── TAKEN: available == False ──────────────────────────────
-        if data.get("available") is False:
-            error_type = str(
-                data.get("error_type", data.get("error", "username_is_taken"))
+        data = _safe_json(resp)
+        if data is None:
+            logger.warning(
+                "[@%s] Lookup API non-JSON (HTTP %d) | body=%s",
+                username, sc, (resp.text or "")[:200],
             )
-            logger.info(
-                "[@%s] TAKEN (available=false, %s) [Phase B]",
-                username, error_type,
+            return CheckResult(
+                username, CheckStatus.ERROR, f"lookup_non_json_{sc}"
             )
-            return CheckResult(username, CheckStatus.TAKEN, error_type)
 
-        # ── TAKEN: error_type signals ─────────────────────────────
-        error_type = str(data.get("error_type", ""))
-        if error_type in (
-            "username_held_by_someone_else",
-            "signup_block",
-            "username_is_taken",
-        ):
-            logger.info(
-                "[@%s] TAKEN (error_type=%s) [Phase B]", username, error_type,
-            )
-            return CheckResult(username, CheckStatus.TAKEN, error_type)
+        logger.debug(
+            "[@%s] Lookup API response: HTTP %d | %s",
+            username, sc, json.dumps(data, ensure_ascii=False)[:300],
+        )
 
-        # ── TAKEN: status == "fail" ────────────────────────────────
+        # ── TAKEN: user kaliti mavjud (profil topildi) ─────────────
+        user_data = data.get("user")
+        if user_data and isinstance(user_data, dict):
+            ig_username = user_data.get("username", username)
+            logger.info(
+                "[@%s] TAKEN (Lookup: user found, ig_user=%s) [Phase B]",
+                username, ig_username,
+            )
+            return CheckResult(username, CheckStatus.TAKEN, "profile_exists")
+
+        # ── TAKEN: user_found == True (user mavjud) ────────────────
+        if data.get("user_found") is True:
+            logger.info(
+                "[@%s] TAKEN (Lookup: user_found=true) [Phase B]", username,
+            )
+            return CheckResult(username, CheckStatus.TAKEN, "profile_exists")
+
+        # ── AVAILABLE: user_found == False ─────────────────────────
+        if data.get("user_found") is False:
+            logger.info(
+                "[@%s] AVAILABLE (Lookup: user_found=false)", username,
+            )
+            return CheckResult(
+                username, CheckStatus.AVAILABLE, "truly_available"
+            )
+
+        # ── AVAILABLE: "No users found" message ───────────────────
+        message = str(data.get("message", "")).lower()
+        if "no users found" in message:
+            logger.info(
+                "[@%s] AVAILABLE (Lookup: 'No users found')", username,
+            )
+            return CheckResult(
+                username, CheckStatus.AVAILABLE, "truly_available"
+            )
+
+        # ── status: fail → tahlil qilish ───────────────────────────
         if data.get("status") == "fail":
             error_type = str(data.get("error_type", "unknown_fail"))
-            message = str(data.get("message", ""))
-            msg_lower = message.lower()
+            fail_message = str(data.get("message", ""))
+            msg_lower = fail_message.lower()
 
             # Rate limit?
             if "wait" in msg_lower or "try again" in msg_lower:
                 logger.warning(
-                    "[@%s] Android API rate limit: %s", username, message[:80],
+                    "[@%s] Lookup API rate limit: %s", username, fail_message[:80],
                 )
                 return CheckResult(
-                    username, CheckStatus.ERROR, "android_rate_limit"
+                    username, CheckStatus.ERROR, "lookup_rate_limit"
                 )
 
             # Checkpoint / spam block?
@@ -538,13 +550,13 @@ class InstagramChecker:
                 "generic_request_error",
             ):
                 logger.warning(
-                    "[@%s] Android API infra block: %s", username, error_type,
+                    "[@%s] Lookup API infra block: %s", username, error_type,
                 )
                 return CheckResult(
-                    username, CheckStatus.ERROR, f"android_block_{error_type}"
+                    username, CheckStatus.ERROR, f"lookup_block_{error_type}"
                 )
 
-            # Boshqa fail -> TAKEN (banned/deleted/cooldown)
+            # Boshqa fail -> TAKEN (banned/deleted/cooldown — username band)
             logger.info(
                 "[@%s] TAKEN (status=fail, %s) [Phase B]",
                 username, error_type,
@@ -553,19 +565,13 @@ class InstagramChecker:
                 username, CheckStatus.TAKEN, f"fail_{error_type}"
             )
 
-        # ── username_suggestions -> TAKEN ──────────────────────────
-        sug = data.get("username_suggestions")
-        if isinstance(sug, list) and len(sug) > 0:
-            logger.info("[@%s] TAKEN (suggestions) [Phase B]", username)
-            return CheckResult(username, CheckStatus.TAKEN, "username_is_taken")
-
         # ── Noaniq -> ERROR (HECH QACHON AVAILABLE emas!) ─────────
         logger.warning(
-            "[@%s] Noaniq Android API javob -> ERROR | body=%s",
+            "[@%s] Noaniq Lookup API javob -> ERROR | body=%s",
             username, str(data)[:200],
         )
         return CheckResult(
-            username, CheckStatus.ERROR, "android_unknown_response"
+            username, CheckStatus.ERROR, "lookup_unknown_response"
         )
 
 
