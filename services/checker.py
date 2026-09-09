@@ -86,10 +86,6 @@ _RESERVED_NAMES: frozenset[str] = frozenset({
 
 # HTML parsing patterns
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
-_OG_TITLE_RE = re.compile(
-    r'<meta\s+(?:property|name)="og:title"\s+content="(.*?)"',
-    re.IGNORECASE,
-)
 _OG_DESC_RE = re.compile(
     r'<meta\s+property="og:description"\s+content="(.*?)"',
     re.IGNORECASE,
@@ -395,76 +391,54 @@ class InstagramChecker:
                 username, CheckStatus.ERROR, "login_page_html"
             )
 
-        # ── <title> va og:title ni ajratib olish ──────────────────
+        # ── <title> va og:description ni ajratib olish ──────────────
         title_m = _TITLE_RE.search(html)
         title = (title_m.group(1).strip() if title_m else "").lower()
-
-        og_title_m = _OG_TITLE_RE.search(html)
-        og_title = (og_title_m.group(1).strip() if og_title_m else "").lower()
 
         og_desc_m = _OG_DESC_RE.search(html)
         og_desc = (og_desc_m.group(1).strip() if og_desc_m else "").lower()
 
         ul = username.lower()
 
-        # ── HTTP 200: "Page Not Found" / "Isn't Available" → AVAILABLE
+        # ── HTTP 200: klassifikatsiya faqat rasmiy meta teglar bo'yicha ──
         if sc == 200:
+            # 1) Instagram "Mavjud emas" sahifasi belgilari → AVAILABLE
             is_not_found = any(
                 phrase in title or phrase in html_lower
                 for phrase in _NOT_FOUND_PHRASES
             )
             if is_not_found:
                 logger.info(
-                    "[@%s] AVAILABLE (HTTP 200 but 'Page Not Found' in HTML) | title=%s",
+                    "[@%s] AVAILABLE (HTTP 200 — 'Page Not Found' in HTML) | title=%s",
                     username, title[:60],
                 )
                 return CheckResult(
                     username, CheckStatus.AVAILABLE, "page_not_found_200"
                 )
 
-        # ── HTTP 200: profil mavjud → TAKEN ────────────────────────
-        if sc == 200:
-            # og:title mavjudligi (Instagram faqat haqiqiy profillar uchun beradi)
-            has_og_title = bool(og_title_m) and len(og_title) > 0
+            # 2) Haqiqiy profil belgilari (FAQAT meta teglar!)
+            #    - og:description ichida "followers" VA "posts" birga bo'lsa
+            has_meta_stats = "followers" in og_desc and "posts" in og_desc
 
-            # title ichida username yoki (@username) ko'rinishi
-            has_username_in_title = (
-                f"(@{ul})" in title
-                or f"@{ul}" in title
-                or ul in title
+            #    - Title ichida "photos and videos" yoki "(@username)"
+            has_profile_title = (
+                "photos and videos" in html_lower
+                or f"(@{ul})" in title
             )
 
-            # og:description ichida followers/following/posts
-            has_social_meta = any(
-                w in og_desc for w in ("followers", "following", "posts")
-            )
-
-            if has_og_title or has_username_in_title or has_social_meta:
+            if has_meta_stats or has_profile_title:
                 logger.info(
-                    "[@%s] TAKEN (profile_exists) | og_title=%s | title=%s",
-                    username,
-                    bool(og_title_m),
-                    title[:60],
+                    "[@%s] TAKEN (profile_exists) | meta_stats=%s | profile_title=%s | title=%s",
+                    username, has_meta_stats, has_profile_title, title[:60],
                 )
                 return CheckResult(
                     username, CheckStatus.TAKEN, "profile_exists"
                 )
 
-            # Username body ichida va sahifa yetarlicha katta → TAKEN
-            if ul in html_lower and len(html) > 10000:
-                logger.info(
-                    "[@%s] TAKEN (username_in_body, html_len=%d)",
-                    username, len(html),
-                )
-                return CheckResult(
-                    username, CheckStatus.TAKEN, "profile_exists"
-                )
-
-            # 200 lekin hech qanday profil belgisi yo'q → AVAILABLE
-            # (bo'sh/stub sahifa, username mavjud emas)
+            # 3) 200 lekin na followers na profil title → bo'sh sahifa → AVAILABLE
             logger.info(
-                "[@%s] AVAILABLE (HTTP 200, no profile signals) | title=%s | html_len=%d",
-                username, title[:60], len(html),
+                "[@%s] AVAILABLE (HTTP 200, no meta profile signals) | title=%s",
+                username, title[:60],
             )
             return CheckResult(
                 username, CheckStatus.AVAILABLE, "no_profile_signals_200"
