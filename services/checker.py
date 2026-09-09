@@ -1,23 +1,25 @@
-"""Instagram username availability checker — Web Profile Info API.
+"""Instagram username availability checker — Web Profile Page HTML.
 
 Architecture:
   Tier 1  — Regex / syntax / reserved pre-validation (no network).
-  Tier 2  — Single GET request to Instagram Web Profile Info API:
-             GET /api/v1/users/web_profile_info/?username={username}
+  Tier 2  — Single browser-like GET request to Instagram profile page:
+             GET https://www.instagram.com/{username}/
              via curl_cffi (Chrome TLS fingerprint).
 
-             HTTP 200 + user data   → TAKEN  (profile exists)
-             HTTP 404 / user null   → AVAILABLE
-             HTTP 400 / user_not_found → AVAILABLE
-             HTTP 302 (login redirect) / 429 → ERROR (retry)
+             HTTP 200 + profil mavjud (og:title / title ichida username)
+                                              → TAKEN
+             HTTP 200 + "Page Not Found" / "Isn't Available"
+                                              → AVAILABLE
+             HTTP 404                         → AVAILABLE
+             HTTP 302 (login redirect) / 429  → ERROR (qayta urinish)
 
-ANONIM REJIM: Hech qanday Instagram akkaunt, session cookie yoki
-CSRF token talab etilmaydi. Signup sahifalari butunlay ishlatilmaydi.
+ANONIM REJIM: Hech qanday Instagram akkaunt, session cookie, CSRF token
+yoki ichki JSON API endpoint ishlatilmaydi. Oddiy brauzer kabi sahifaga
+kirib HTML kontenti tahlil qilinadi.
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import random
 import re
@@ -44,9 +46,8 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-# Web Profile Info endpoint
-_PROFILE_INFO_URL = "https://www.instagram.com/api/v1/users/web_profile_info/?username={}"
-_API_TIMEOUT = 12.0
+_PROFILE_URL_TPL = "https://www.instagram.com/{}/"
+_PAGE_TIMEOUT = 12.0
 _IMPERSONATE = "chrome124"
 _PROXY_RETRY_DELAY = 1.0
 
@@ -55,7 +56,19 @@ _CHROME_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-_IG_APP_ID = "936619743392459"
+_BROWSER_HEADERS: dict[str, str] = {
+    "User-Agent": _CHROME_USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 # Network exceptions
 _CURL_NETWORK_EXCEPTIONS = (
@@ -70,6 +83,28 @@ _RESERVED_NAMES: frozenset[str] = frozenset({
     "accounts", "explore", "direct", "security", "about", "developer",
     "meta", "privacy", "terms", "settings", "profile",
 })
+
+# HTML parsing patterns
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_OG_TITLE_RE = re.compile(
+    r'<meta\s+(?:property|name)="og:title"\s+content="(.*?)"',
+    re.IGNORECASE,
+)
+_OG_DESC_RE = re.compile(
+    r'<meta\s+property="og:description"\s+content="(.*?)"',
+    re.IGNORECASE,
+)
+
+# "Page Not Found" / "Isn't Available" detection keywords (case-insensitive)
+_NOT_FOUND_PHRASES = (
+    "page not found",
+    "isn't available",
+    "isn\u2019t available",
+    "this page isn",
+    "content unavailable",
+    "sorry, this page",
+    "the link you followed may be broken",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -98,60 +133,23 @@ class CheckResult:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _safe_json_curl(resp: Any) -> dict[str, Any] | None:
-    """Safely parse JSON dict from curl_cffi response."""
-    try:
-        data = resp.json()
-        if isinstance(data, dict):
-            return data
-    except Exception:
-        pass
-    content = getattr(resp, "content", b"")
-    if isinstance(content, (bytes, bytearray)):
-        text = bytes(content).decode("utf-8", errors="ignore").strip()
-    else:
-        text = str(getattr(resp, "text", "") or "").strip()
-    if not text or text[0] != "{":
-        return None
-    try:
-        data = json.loads(text)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
-def _build_headers(username: str) -> dict[str, str]:
-    """Build request headers for Web Profile Info API."""
-    return {
-        "User-Agent": _CHROME_USER_AGENT,
-        "X-IG-App-ID": _IG_APP_ID,
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "*/*",
-        "Referer": f"https://www.instagram.com/{username}/",
-    }
-
-
-# ---------------------------------------------------------------------------
 # Main checker class
 # ---------------------------------------------------------------------------
 
 class InstagramChecker:
     """
-    Anonim Instagram username availability checker — Web Profile Info API.
+    Anonim Instagram username availability checker — Web Profile Page HTML.
 
-    Hech qanday Instagram akkaunt, session cookie yoki CSRF token talab etilmaydi.
-    Signup sahifalari butunlay ishlatilmaydi.
+    Hech qanday Instagram akkaunt, session cookie, CSRF token yoki ichki
+    JSON API endpoint ishlatilmaydi.
 
-    curl_cffi (Chrome TLS fingerprint) orqali web_profile_info GET endpointi
-    tekshiriladi.
+    curl_cffi (Chrome TLS fingerprint) orqali oddiy brauzer kabi profil
+    sahifasiga GET so'rov yuboriladi va HTML kontenti tahlil qilinadi.
 
     QOIDALAR:
-      AVAILABLE — HTTP 404 yoki user data null/topilmadi.
-      TAKEN     — HTTP 200 + user data mavjud.
-      ERROR     — Network/proxy/429/redirect infra muammo.
+      AVAILABLE — HTTP 404 yoki 200 + "Page Not Found" / "Isn't Available".
+      TAKEN     — HTTP 200 + og:title / title ichida username ko'rinsa.
+      ERROR     — Network/proxy/429/login redirect.
     """
 
     def __init__(self, proxy_url: str | None = None) -> None:
@@ -161,7 +159,7 @@ class InstagramChecker:
         self._in_flight: set[str] = set()
 
         logger.info(
-            "InstagramChecker ready (Web Profile Info + curl_cffi) | proxy=%s | mode=anonymous",
+            "InstagramChecker ready (Web Profile Page + curl_cffi) | proxy=%s | mode=anonymous",
             bool(self._proxy),
         )
 
@@ -171,7 +169,7 @@ class InstagramChecker:
 
     async def start(self) -> None:
         logger.info(
-            "InstagramChecker started (Web Profile Info, curl_cffi, no session needed)"
+            "InstagramChecker started (Web Profile Page HTML, curl_cffi, no API needed)"
         )
 
     async def stop(self) -> None:
@@ -190,8 +188,8 @@ class InstagramChecker:
         Instagram username mavjudligini tekshirish.
 
         Returns:
-          AVAILABLE — Username Instagramda mavjud emas (404 / user_not_found).
-          TAKEN     — Profil mavjud (HTTP 200 + user data).
+          AVAILABLE — Username Instagramda mavjud emas (404 / Page Not Found).
+          TAKEN     — Profil mavjud (HTTP 200 + profil sahifasi).
           ERROR     — Infra muammo (network/proxy/429/redirect).
         """
         clean = username.strip().lstrip("@").lower()
@@ -214,7 +212,7 @@ class InstagramChecker:
 
             last: CheckResult | None = None
             for attempt in range(1, max_retries + 1):
-                result = await self._web_profile_info_check(clean)
+                result = await self._profile_page_check(clean)
                 result.attempts = attempt
 
                 if result.status != CheckStatus.ERROR:
@@ -265,28 +263,27 @@ class InstagramChecker:
         return None
 
     # ------------------------------------------------------------------
-    # Web Profile Info GET (curl_cffi, Chrome TLS, NO AUTH)
+    # Profile Page GET (curl_cffi, Chrome TLS, NO API)
     # ------------------------------------------------------------------
 
-    async def _web_profile_info_check(
+    async def _profile_page_check(
         self, username: str
     ) -> CheckResult:
         """
-        GET /api/v1/users/web_profile_info/?username={username}
+        GET https://www.instagram.com/{username}/
         via curl_cffi (Chrome TLS fingerprint).
 
-        Klassifikatsiya:
-          HTTP 200 + data.user mavjud        → TAKEN
-          HTTP 404                            → AVAILABLE
-          HTTP 400 / user_not_found in body   → AVAILABLE
-          HTTP 302 (login redirect) / 429     → ERROR (qayta urinish)
+        Klassifikatsiya (HTML asosida):
+          HTTP 200 + og:title yoki title ichida username → TAKEN
+          HTTP 200 + "Page Not Found" / "Isn't Available" → AVAILABLE
+          HTTP 404                                        → AVAILABLE
+          HTTP 302 (login redirect) / 429                 → ERROR
         """
-        url = _PROFILE_INFO_URL.format(username)
-        headers = _build_headers(username)
+        url = _PROFILE_URL_TPL.format(username)
 
         session_kwargs: dict[str, Any] = {
             "impersonate": _IMPERSONATE,
-            "timeout": _API_TIMEOUT,
+            "timeout": _PAGE_TIMEOUT,
             "verify": False,
         }
         if self._proxy:
@@ -301,10 +298,9 @@ class InstagramChecker:
                 async with AsyncSession(**session_kwargs) as session:
                     resp = await session.get(
                         url,
-                        headers=headers,
-                        allow_redirects=False,  # Redirect'ni qo'lda aniqlash
+                        headers=_BROWSER_HEADERS,
+                        allow_redirects=False,
                     )
-                # Muvaffaqiyat — loopdan chiqamiz
                 break
 
             except _CURL_NETWORK_EXCEPTIONS as exc:
@@ -318,7 +314,7 @@ class InstagramChecker:
                     continue
                 detail = f"network_{type(exc).__name__}"
                 logger.warning(
-                    "[@%s] Web Profile Info xato (barcha urinishlar): %s",
+                    "[@%s] Profile page xato (barcha urinishlar): %s",
                     username, exc,
                 )
                 return CheckResult(username, CheckStatus.ERROR, detail)
@@ -334,14 +330,14 @@ class InstagramChecker:
                     continue
                 detail = f"unexpected_{type(exc).__name__}"
                 logger.warning(
-                    "[@%s] Web Profile Info kutilmagan (barcha): %s",
+                    "[@%s] Profile page kutilmagan (barcha): %s",
                     username, exc,
                 )
                 return CheckResult(username, CheckStatus.ERROR, detail)
 
         if resp is None:
             logger.warning(
-                "[@%s] Web Profile Info: barcha %d urinish xato",
+                "[@%s] Profile page: barcha %d urinish xato",
                 username, max_proxy_retries,
             )
             return CheckResult(
@@ -352,8 +348,8 @@ class InstagramChecker:
 
         # ── 429 → ERROR (rate limited) ─────────────────────────────
         if sc == 429:
-            logger.warning("[@%s] Web Profile Info 429 (rate limited)", username)
-            return CheckResult(username, CheckStatus.ERROR, "api_429")
+            logger.warning("[@%s] Profile page 429 (rate limited)", username)
+            return CheckResult(username, CheckStatus.ERROR, "page_429")
 
         # ── 302 redirect (login sahifasiga) → ERROR ────────────────
         if sc in (301, 302, 303, 307, 308):
@@ -365,7 +361,7 @@ class InstagramChecker:
             except Exception:
                 pass
             logger.warning(
-                "[@%s] Web Profile Info redirect (%d) -> %s",
+                "[@%s] Profile page redirect (%d) -> %s",
                 username, sc, location[:100],
             )
             return CheckResult(
@@ -375,117 +371,112 @@ class InstagramChecker:
         # ── 404 → AVAILABLE ────────────────────────────────────────
         if sc == 404:
             logger.info(
-                "[@%s] AVAILABLE (HTTP 404 — user not found)", username,
+                "[@%s] AVAILABLE (HTTP 404 — page not found)", username,
             )
             return CheckResult(
                 username, CheckStatus.AVAILABLE, "not_found_404"
             )
 
-        # ── Response body tahlil qilish ────────────────────────────
-        body_text = ""
+        # ── HTML kontentni olish ───────────────────────────────────
+        html = ""
         try:
-            body_text = str(getattr(resp, "text", "") or "")
+            html = str(getattr(resp, "text", "") or "")
         except Exception:
             pass
 
-        # ── 400 yoki user_not_found in body → AVAILABLE ────────────
-        if sc == 400 or "user_not_found" in body_text.lower():
-            logger.info(
-                "[@%s] AVAILABLE (HTTP %d / user_not_found)", username, sc,
-            )
-            return CheckResult(
-                username, CheckStatus.AVAILABLE, f"not_found_{sc}"
-            )
+        html_lower = html.lower()
 
-        # ── JSON parse qilish ──────────────────────────────────────
-        data = _safe_json_curl(resp)
-
-        if data is None:
-            body_preview = body_text[:200] if body_text else "(empty)"
+        # ── Login sahifasiga yo'naltirilgan (HTML ichida) → ERROR ──
+        if "/accounts/login/" in html_lower and len(html) < 5000:
             logger.warning(
-                "[@%s] Web Profile Info non-JSON (HTTP %d) | body=%s",
-                username, sc, body_preview,
+                "[@%s] Profile page: login redirect (HTML ichida)", username,
             )
-            # Login sahifasi HTML bo'lishi mumkin
-            if "login" in body_text.lower() or "/accounts/login/" in body_text.lower():
-                return CheckResult(
-                    username, CheckStatus.ERROR, "login_page_html"
-                )
             return CheckResult(
-                username, CheckStatus.ERROR, f"non_json_{sc}"
+                username, CheckStatus.ERROR, "login_page_html"
             )
 
-        logger.debug(
-            "[@%s] Web Profile Info response: HTTP %d | %s",
-            username, sc, json.dumps(data, ensure_ascii=False)[:300],
-        )
+        # ── <title> va og:title ni ajratib olish ──────────────────
+        title_m = _TITLE_RE.search(html)
+        title = (title_m.group(1).strip() if title_m else "").lower()
 
-        # ── HTTP 200 + user data → TAKEN ───────────────────────────
+        og_title_m = _OG_TITLE_RE.search(html)
+        og_title = (og_title_m.group(1).strip() if og_title_m else "").lower()
+
+        og_desc_m = _OG_DESC_RE.search(html)
+        og_desc = (og_desc_m.group(1).strip() if og_desc_m else "").lower()
+
+        ul = username.lower()
+
+        # ── HTTP 200: "Page Not Found" / "Isn't Available" → AVAILABLE
         if sc == 200:
-            user_data = None
-            # Standard format: {"data": {"user": {...}}}
-            data_block = data.get("data")
-            if isinstance(data_block, dict):
-                user_data = data_block.get("user")
-
-            # Alternative: {"user": {...}} (to'g'ridan-to'g'ri)
-            if user_data is None:
-                user_data = data.get("user")
-
-            if user_data and isinstance(user_data, dict):
-                ig_username = user_data.get("username", "")
+            is_not_found = any(
+                phrase in title or phrase in html_lower
+                for phrase in _NOT_FOUND_PHRASES
+            )
+            if is_not_found:
                 logger.info(
-                    "[@%s] TAKEN (profile_exists, ig_user=%s) [Web Profile Info]",
-                    username, ig_username,
+                    "[@%s] AVAILABLE (HTTP 200 but 'Page Not Found' in HTML) | title=%s",
+                    username, title[:60],
+                )
+                return CheckResult(
+                    username, CheckStatus.AVAILABLE, "page_not_found_200"
+                )
+
+        # ── HTTP 200: profil mavjud → TAKEN ────────────────────────
+        if sc == 200:
+            # og:title mavjudligi (Instagram faqat haqiqiy profillar uchun beradi)
+            has_og_title = bool(og_title_m) and len(og_title) > 0
+
+            # title ichida username yoki (@username) ko'rinishi
+            has_username_in_title = (
+                f"(@{ul})" in title
+                or f"@{ul}" in title
+                or ul in title
+            )
+
+            # og:description ichida followers/following/posts
+            has_social_meta = any(
+                w in og_desc for w in ("followers", "following", "posts")
+            )
+
+            if has_og_title or has_username_in_title or has_social_meta:
+                logger.info(
+                    "[@%s] TAKEN (profile_exists) | og_title=%s | title=%s",
+                    username,
+                    bool(og_title_m),
+                    title[:60],
                 )
                 return CheckResult(
                     username, CheckStatus.TAKEN, "profile_exists"
                 )
 
-            # HTTP 200 lekin user null/None → AVAILABLE
-            if user_data is None:
+            # Username body ichida va sahifa yetarlicha katta → TAKEN
+            if ul in html_lower and len(html) > 10000:
                 logger.info(
-                    "[@%s] AVAILABLE (HTTP 200 but user is null)", username,
+                    "[@%s] TAKEN (username_in_body, html_len=%d)",
+                    username, len(html),
                 )
                 return CheckResult(
-                    username, CheckStatus.AVAILABLE, "user_null_200"
+                    username, CheckStatus.TAKEN, "profile_exists"
                 )
 
-        # ── status check (agar mavjud bo'lsa) ──────────────────────
-        status_field = data.get("status", "")
-        if status_field == "fail":
-            error_type = str(data.get("error_type", ""))
-            message = str(data.get("message", ""))
+            # 200 lekin hech qanday profil belgisi yo'q → AVAILABLE
+            # (bo'sh/stub sahifa, username mavjud emas)
+            logger.info(
+                "[@%s] AVAILABLE (HTTP 200, no profile signals) | title=%s | html_len=%d",
+                username, title[:60], len(html),
+            )
+            return CheckResult(
+                username, CheckStatus.AVAILABLE, "no_profile_signals_200"
+            )
 
-            # Rate limit
-            if any(w in message.lower() for w in ("wait", "try again", "rate")):
-                logger.warning(
-                    "[@%s] Web Profile Info rate limit: %s", username, message[:80],
-                )
-                return CheckResult(
-                    username, CheckStatus.ERROR, "api_rate_limit"
-                )
-
-            # IP block / checkpoint
-            if error_type in (
-                "checkpoint_required", "checkpoint_challenge_required",
-                "spam", "rate_limit_error", "sentry_block",
-                "generic_request_error", "ip_block",
-            ):
-                logger.warning(
-                    "[@%s] Web Profile Info infra block: %s", username, error_type,
-                )
-                return CheckResult(
-                    username, CheckStatus.ERROR, f"block_{error_type}"
-                )
-
-        # ── Noaniq → ERROR ─────────────────────────────────────────
+        # ── Boshqa status kodlar → ERROR ───────────────────────────
         logger.warning(
-            "[@%s] Noaniq Web Profile Info javob -> ERROR | HTTP %d | body=%s",
-            username, sc, str(data)[:200],
+            "[@%s] Noaniq HTTP %d -> ERROR | title=%s | html_len=%d",
+            username, sc, title[:60], len(html),
         )
         return CheckResult(
-            username, CheckStatus.ERROR, f"unknown_response_{sc}"
+            username, CheckStatus.ERROR, f"unexpected_http_{sc}"
         )
 
 
