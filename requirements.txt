@@ -10,8 +10,10 @@
 aiogram==3.13.1
 
 # ─── HTTP Client (Instagram so'rovlari uchun) ───────────────
-# httpx: Phase A (profil GET) va Phase B (Android API POST) uchun
+# httpx: Phase A (profil GET) uchun
 httpx[socks]==0.27.2
+# curl_cffi: Phase B (Chrome TLS fingerprint, signup dryrun) uchun
+curl_cffi>=0.7.1
 
 # ─── Database ───────────────────────────────────────────────
 SQLAlchemy[asyncio]==2.0.36
