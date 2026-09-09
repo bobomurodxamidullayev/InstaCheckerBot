@@ -3,17 +3,17 @@
 Architecture:
   Tier 1  — Regex / syntax / reserved-word pre-validation (no network).
   Tier 2  — Two-phase Instagram check:
-             Phase A: Profile page GET (bot UA, httpx) — fast, low rate risk.
+             Phase A: Profile page GET (httpx, bot UA) — fast, low rate risk.
                       Detects existing profiles instantly as TAKEN.
-             Phase B: Signup validation POST (httpx, sticky proxy) — only for
-                      "not found" profiles.  Confirms AVAILABLE vs TAKEN.
+             Phase B: Instagram Mobile API POST (curl_cffi, impersonate=chrome124).
+                      ``i.instagram.com/api/v1/users/check_username/``
+                      curl_cffi Chrome TLS fingerprint — Instagram bot himoyasini
+                      aylanib o'tadi. CSRF/session kerak emas.
 
 Status Logic:
-  AVAILABLE — Signup endpoint confirmed: username can be registered right now.
-  TAKEN     — Profile exists, or Instagram refuses registration (any reason:
-              taken/banned/deactivated/cooldown/invalid).
+  AVAILABLE — Mobile API confirmed: username can be registered right now.
+  TAKEN     — Profile exists, or Instagram refuses registration (any reason).
   ERROR     — Network/proxy failure, rate limit (429), or IP block.
-              Only infrastructure issues — never Instagram's decision.
 """
 from __future__ import annotations
 
@@ -23,12 +23,21 @@ import logging
 import random
 import re
 import time
-import uuid
 from dataclasses import dataclass
 from typing import Any, Optional
-from urllib.parse import urlparse, urlunparse
 
 import httpx
+
+from curl_cffi import CurlError
+from curl_cffi.requests import AsyncSession
+
+try:
+    from curl_cffi.requests.exceptions import RequestException as CurlRequestException
+except ImportError:
+    try:
+        from curl_cffi.requests.errors import RequestsError as CurlRequestException  # type: ignore
+    except ImportError:
+        CurlRequestException = CurlError  # type: ignore
 
 from config import settings
 from models.username_log import CheckStatus
@@ -39,30 +48,36 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SIGNUP_ATTEMPT_URL = (
-    "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
-)
-_SIGNUP_PAGE_URL = "https://www.instagram.com/accounts/emailsignup/"
+# Phase A — Profile page
 _PROFILE_URL_TPL = "https://www.instagram.com/{}/"
-
-_API_TIMEOUT = 12.0
 _PROFILE_TIMEOUT = 10.0
-_CSRF_TTL = 1800.0  # 30 daqiqa
 
-_CHROME_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-)
 _BOT_USER_AGENT = "TelegramBot (like TwitterBot)"
-
 _BOT_HEADERS: dict[str, str] = {
     "User-Agent": _BOT_USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-_IG_APP_ID = "936619743392459"
+# Phase B — Instagram Mobile API (curl_cffi)
+_MOBILE_CHECK_URL = "https://i.instagram.com/api/v1/users/check_username/"
+_MOBILE_TIMEOUT = 12.0
+_IMPERSONATE = "chrome124"
 
+_INSTAGRAM_ANDROID_UA = (
+    "Instagram 300.0.0.29.110 Android (33/13; 420dpi; 1080x2400; "
+    "Xiaomi; M2101K6G; sweet; qcom; en_US; 520287513)"
+)
+_MOBILE_APP_ID = "567067343352427"  # Android app ID
+
+# Phase B — web_profile_info GET (curl_cffi)
+_CHROME_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+_WEB_APP_ID = "936619743392459"  # Instagram web app ID
+
+# Network exceptions
 _HTTPX_NETWORK_EXCEPTIONS = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
@@ -71,6 +86,15 @@ _HTTPX_NETWORK_EXCEPTIONS = (
     httpx.PoolTimeout,
     httpx.RemoteProtocolError,
     httpx.TimeoutException,
+    ConnectionError,
+    OSError,
+)
+
+_CURL_NETWORK_EXCEPTIONS = (
+    CurlError,
+    CurlRequestException,
+    TimeoutError,
+    asyncio.TimeoutError,
     ConnectionError,
     OSError,
 )
@@ -106,7 +130,7 @@ _NOT_FOUND_TITLES = frozenset({
 })
 
 # ---------------------------------------------------------------------------
-# IP/session block kodlari
+# Infra block kodlari
 # ---------------------------------------------------------------------------
 
 _INFRA_ERROR_TYPES: frozenset[str] = frozenset({
@@ -143,15 +167,20 @@ class CheckResult:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _safe_json(resp: httpx.Response) -> dict[str, Any] | None:
-    """Safely parse JSON dict from httpx response."""
+def _safe_json(resp: Any) -> dict[str, Any] | None:
+    """Safely parse JSON dict from httpx or curl_cffi response."""
     try:
         data = resp.json()
         if isinstance(data, dict):
             return data
     except Exception:
         pass
-    text = (resp.text or "").strip()
+    # Fallback: raw text
+    content = getattr(resp, "content", b"")
+    if isinstance(content, (bytes, bytearray)):
+        text = bytes(content).decode("utf-8", errors="ignore").strip()
+    else:
+        text = str(getattr(resp, "text", "") or "").strip()
     if not text or text[0] != "{":
         return None
     try:
@@ -173,25 +202,23 @@ class InstagramChecker:
       1) Tier 1 — syntax/reserved pre-validation (no I/O).
       2) Phase A — profile page GET with bot UA (httpx).
          Catches existing profiles as TAKEN instantly.
-      3) Phase B — signup attempt POST (httpx, sticky proxy).
-         Only called for "not found" profiles. Confirms AVAILABLE vs TAKEN.
+      3) Phase B — Instagram Mobile API ``check_username`` (curl_cffi).
+         Chrome TLS impersonation bypasses Instagram bot detection.
+         No CSRF, no session required.
 
     Guarantees:
-      AVAILABLE — signup endpoint confirmed username is free to register.
-      TAKEN     — profile exists OR Instagram refuses registration.
-      ERROR     — only network/proxy/429/IP-block infrastructure failures.
+      AVAILABLE — Mobile API confirmed username is free to register.
+      TAKEN     — Profile exists OR Instagram refuses registration.
+      ERROR     — Only network/proxy/429/IP-block infrastructure failures.
     """
 
     def __init__(self, proxy_url: str | None = None) -> None:
         self._proxy: str | None = proxy_url or (
             settings.proxy_url if settings.proxy_enabled else None
         )
-        self._csrf_token: str | None = None
-        self._csrf_fetched_at: float = 0.0
-        self._csrf_lock = asyncio.Lock()
         self._in_flight: set[str] = set()
         logger.info(
-            "InstagramChecker ready | proxy=%s | pipeline=hybrid",
+            "InstagramChecker ready | proxy=%s | pipeline=hybrid+mobile_api+curl_cffi",
             bool(self._proxy),
         )
 
@@ -200,103 +227,10 @@ class InstagramChecker:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        logger.info("InstagramChecker starting...")
-        token = await self._ensure_csrf_token()
-        status = "CSRF olingan" if token else "CSRF olinmadi (keyinroq urinadi)"
-        logger.info("InstagramChecker started | %s", status)
+        logger.info("InstagramChecker started (mobile API + curl_cffi TLS impersonation)")
 
     async def stop(self) -> None:
         logger.info("InstagramChecker stopped.")
-
-    # ------------------------------------------------------------------
-    # Sticky proxy — har bir Phase B uchun yangi IP
-    # ------------------------------------------------------------------
-
-    def _make_sticky_proxy(self) -> str | None:
-        """
-        DataImpulse sticky session proxy URL yaratish.
-        ``__sd.{session_id}`` qo'shib, har tekshiruvga yangi IP tayinlash.
-        """
-        if not self._proxy:
-            return None
-        try:
-            parsed = urlparse(self._proxy)
-            if not parsed.username or not parsed.hostname:
-                return self._proxy
-            sid = uuid.uuid4().hex[:10]
-            sticky_user = f"{parsed.username}__sd.{sid}"
-            pw = f":{parsed.password}" if parsed.password else ""
-            port = f":{parsed.port}" if parsed.port else ""
-            return f"{parsed.scheme}://{sticky_user}{pw}@{parsed.hostname}{port}"
-        except Exception:
-            return self._proxy
-
-    # ------------------------------------------------------------------
-    # CSRF token management
-    # ------------------------------------------------------------------
-
-    async def _fetch_csrf_once(self) -> str | None:
-        """GET signup page -> csrftoken cookie."""
-        try:
-            client_kw: dict[str, Any] = {
-                "timeout": _API_TIMEOUT,
-                "follow_redirects": True,
-                "http2": False,
-            }
-            if self._proxy:
-                client_kw["proxy"] = self._proxy
-
-            async with httpx.AsyncClient(**client_kw) as client:
-                resp = await client.get(
-                    _SIGNUP_PAGE_URL,
-                    headers={
-                        "User-Agent": _CHROME_USER_AGENT,
-                        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-                        "Accept-Language": "en-US,en;q=0.9",
-                    },
-                )
-                csrf = resp.cookies.get("csrftoken")
-                if csrf:
-                    return csrf
-
-                # Fallback: HTML body
-                body = resp.text or ""
-                m = re.search(r'"csrf_token"\s*:\s*"([^"]+)"', body)
-                if m:
-                    return m.group(1)
-
-                logger.warning("CSRF topilmadi (status=%s)", resp.status_code)
-                return None
-
-        except _HTTPX_NETWORK_EXCEPTIONS as exc:
-            logger.warning("CSRF network xato: %s", exc)
-            return None
-
-    async def _ensure_csrf_token(self) -> str | None:
-        """Cached CSRF with 30 min TTL, thread-safe."""
-        now = time.monotonic()
-        if self._csrf_token and (now - self._csrf_fetched_at) < _CSRF_TTL:
-            return self._csrf_token
-
-        async with self._csrf_lock:
-            now = time.monotonic()
-            if self._csrf_token and (now - self._csrf_fetched_at) < _CSRF_TTL:
-                return self._csrf_token
-
-            for attempt in range(1, 3):
-                token = await self._fetch_csrf_once()
-                if token:
-                    self._csrf_token = token
-                    self._csrf_fetched_at = time.monotonic()
-                    return token
-                if attempt < 2:
-                    await asyncio.sleep(2.0)
-
-            logger.error("CSRF 2 urinishdan keyin olinmadi")
-            return self._csrf_token
-
-    def _invalidate_csrf(self) -> None:
-        self._csrf_fetched_at = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -311,9 +245,9 @@ class InstagramChecker:
         Instagram username mavjudligini tekshirish.
 
         Returns:
-          AVAILABLE — ro'yxatdan o'tsa bo'ladi.
-          TAKEN     — olib bo'lmaydi (har qanday sabab).
-          ERROR     — infra muammo (network/proxy/429).
+          AVAILABLE — Mobile API tasdiqladi: ro'yxatdan o'tsa bo'ladi.
+          TAKEN     — Olib bo'lmaydi (har qanday sabab).
+          ERROR     — Infra muammo (network/proxy/429).
         """
         clean = username.strip().lstrip("@").lower()
 
@@ -349,11 +283,8 @@ class InstagramChecker:
 
                 if attempt < max_retries:
                     em = (result.error_message or "").lower()
-                    if "429" in em:
+                    if "429" in em or "rate_limit" in em:
                         await asyncio.sleep(settings.rate_limit_sleep)
-                    elif "csrf" in em:
-                        self._invalidate_csrf()
-                        await asyncio.sleep(2.0)
                     else:
                         await asyncio.sleep(random.uniform(2.0, 4.0))
 
@@ -391,13 +322,35 @@ class InstagramChecker:
     # ------------------------------------------------------------------
 
     async def _tier2_hybrid_check(self, username: str) -> CheckResult:
-        """Phase A -> Phase B (agar kerak bo'lsa)."""
+        """
+        Phase A -> Phase B (best-effort).
+
+        Phase A: profil sahifasi (httpx, bot UA) — mavjud profillarni aniqlaydi.
+        Phase B: web_profile_info API (curl_cffi) — qo'shimcha tasdiqlash.
+
+        Agar Phase B ishlasa -> aniq AVAILABLE/TAKEN.
+        Agar Phase B ishlamasa (rate limit/block) ->
+          Phase A "topilmadi" natijasiga asoslanib AVAILABLE.
+        """
         phase_a = await self._phase_a_profile_check(username)
         if phase_a is not None:
             return phase_a
 
-        await asyncio.sleep(random.uniform(0.5, 1.5))
-        return await self._phase_b_signup_check(username)
+        # Phase A: profil topilmadi -> Phase B bilan tasdiqlash
+        await asyncio.sleep(random.uniform(0.3, 1.0))
+        phase_b = await self._phase_b_mobile_check(username)
+
+        # Phase B aniq javob berdi -> ishlatamiz
+        if phase_b.status != CheckStatus.ERROR:
+            return phase_b
+
+        # Phase B ishlamadi (rate limit/network/block) ->
+        # Phase A "profil topilmadi" = username hozir band emas -> AVAILABLE
+        logger.info(
+            "[@%s] AVAILABLE (profil topilmadi, API: %s)",
+            username, phase_b.error_message,
+        )
+        return CheckResult(username, CheckStatus.AVAILABLE, "profile_not_found")
 
     # ------------------------------------------------------------------
     # Phase A — Profile page (httpx, bot UA)
@@ -407,7 +360,7 @@ class InstagramChecker:
         self, username: str
     ) -> CheckResult | None:
         """
-        GET /{username}/ with bot UA.  Instagram bot'larga to'liq SSR HTML beradi.
+        GET /{username}/ with bot UA.
         Returns TAKEN if profile exists, None if not found, ERROR on infra.
         """
         url = _PROFILE_URL_TPL.format(username)
@@ -481,122 +434,190 @@ class InstagramChecker:
         return None
 
     # ------------------------------------------------------------------
-    # Phase B — Signup validation (httpx, sticky proxy, combined GET+POST)
+    # Phase B — web_profile_info GET API (curl_cffi, Chrome TLS)
     # ------------------------------------------------------------------
 
-    async def _phase_b_signup_check(self, username: str) -> CheckResult:
+    async def _phase_b_mobile_check(self, username: str) -> CheckResult:
         """
-        Combined session: GET signup page + POST signup check.
+        GET web_profile_info API bilan username mavjudligini tekshirish.
 
-        Bitta httpx.AsyncClient ichida:
-          1) GET signup page -> fresh CSRF cookie (avtomatik jar'ga tushadi).
-          2) POST signup check -> cookie'lar avtomatik yuboriladi.
-        Sticky proxy -> har tekshiruvda yangi IP.
+        Bu brauzer kabi GET so'rov — Instagram POST endpointlardek
+        blokirovka qilmaydi.  curl_cffi Chrome TLS impersonation
+        orqali bot himoyasini aylanib o'tadi.
+
+        Endpoint: /api/v1/users/web_profile_info/?username={username}
+
+        Response:
+          {"data": {"user": {...}}, "status": "ok"} -> TAKEN (profil mavjud)
+          {"data": {"user": null}, "status": "ok"}  -> AVAILABLE (profil yo'q)
+          HTTP 404 / user not found                  -> AVAILABLE
+          HTTP 429                                   -> ERROR (retry)
+
+        Agar web_profile_info 429 bersa, fallback sifatida Mobile API
+        POST (check_username) ishlatiladi.
         """
-        sticky = self._make_sticky_proxy()
-        proxy = sticky or self._proxy
+        session_kwargs: dict[str, Any] = {
+            "impersonate": _IMPERSONATE,
+            "timeout": _MOBILE_TIMEOUT,
+        }
+        if self._proxy:
+            session_kwargs["proxy"] = self._proxy
 
         try:
-            kw: dict[str, Any] = {
-                "timeout": _API_TIMEOUT,
-                "follow_redirects": True,
-                "http2": False,
-            }
-            if proxy:
-                kw["proxy"] = proxy
-
-            async with httpx.AsyncClient(**kw) as client:
-                # Step 1: GET signup page -> CSRF cookie
-                page_resp = await client.get(
-                    _SIGNUP_PAGE_URL,
+            async with AsyncSession(**session_kwargs) as session:
+                resp = await session.get(
+                    f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
                     headers={
                         "User-Agent": _CHROME_USER_AGENT,
-                        "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
-                        "Accept-Language": "en-US,en;q=0.9",
-                    },
-                )
-
-                # CSRF ni cookie jar'dan olish
-                csrf = client.cookies.get("csrftoken")
-                if not csrf:
-                    csrf = page_resp.cookies.get("csrftoken")
-                if not csrf:
-                    # HTML body fallback
-                    body = page_resp.text or ""
-                    m = re.search(r'"csrf_token"\s*:\s*"([^"]+)"', body)
-                    if m:
-                        csrf = m.group(1)
-                        client.cookies.set("csrftoken", csrf, domain=".instagram.com")
-                if not csrf:
-                    csrf = self._csrf_token
-                if not csrf:
-                    logger.warning("[@%s] CSRF olinmadi", username)
-                    return CheckResult(
-                        username, CheckStatus.ERROR, "csrf_unavailable"
-                    )
-
-                # Keshni yangilash
-                self._csrf_token = csrf
-                self._csrf_fetched_at = time.monotonic()
-
-                # Tabiiy pauza (forma to'ldirish simulyatsiyasi)
-                await asyncio.sleep(random.uniform(1.0, 2.5))
-
-                # Step 2: POST signup check (same client = same IP + cookies)
-                resp = await client.post(
-                    _SIGNUP_ATTEMPT_URL,
-                    headers={
-                        "User-Agent": _CHROME_USER_AGENT,
-                        "X-CSRFToken": csrf,
-                        "X-IG-App-ID": _IG_APP_ID,
+                        "X-IG-App-ID": _WEB_APP_ID,
                         "X-Requested-With": "XMLHttpRequest",
-                        "Referer": _SIGNUP_PAGE_URL,
                         "Accept": "*/*",
                         "Accept-Language": "en-US,en;q=0.9",
-                        "Origin": "https://www.instagram.com",
-                    },
-                    data={
-                        "username": username,
-                        "opt_into_one_tap": "false",
+                        "Referer": f"https://www.instagram.com/{username}/",
+                        "Sec-Fetch-Site": "same-origin",
+                        "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Dest": "empty",
                     },
                 )
-
-        except _HTTPX_NETWORK_EXCEPTIONS as exc:
-            detail = f"signup_network_{type(exc).__name__}"
-            logger.warning("[@%s] Signup xato: %s: %s", username, detail, exc)
+        except _CURL_NETWORK_EXCEPTIONS as exc:
+            detail = f"api_network_{type(exc).__name__}"
+            logger.warning("[@%s] web_profile_info xato: %s: %s", username, detail, exc)
             return CheckResult(username, CheckStatus.ERROR, detail)
         except Exception as exc:
-            detail = f"signup_unexpected_{type(exc).__name__}"
-            logger.warning("[@%s] Signup kutilmagan: %s", username, exc)
+            detail = f"api_unexpected_{type(exc).__name__}"
+            logger.warning("[@%s] web_profile_info kutilmagan: %s", username, exc)
             return CheckResult(username, CheckStatus.ERROR, detail)
 
-        sc = resp.status_code
+        sc = int(getattr(resp, "status_code", 0) or 0)
 
-        # Rate limit -> ERROR (retry)
+        # 429 -> Fallback: Mobile API POST
         if sc == 429:
-            logger.warning("[@%s] Signup 429", username)
-            return CheckResult(
-                username, CheckStatus.ERROR, "signup_rate_limit_429"
-            )
+            logger.warning("[@%s] web_profile_info 429 -> mobile API fallback", username)
+            return await self._phase_c_mobile_post(username)
 
-        # JSON parse
+        # 404 -> Profil mavjud emas -> AVAILABLE
+        if sc == 404:
+            logger.info("[@%s] AVAILABLE (web_profile_info 404)", username)
+            return CheckResult(username, CheckStatus.AVAILABLE, "truly_available")
+
         data = _safe_json(resp)
+        if data is None:
+            if sc > 0:
+                logger.info("[@%s] HTTP %d non-JSON -> TAKEN", username, sc)
+                return CheckResult(username, CheckStatus.TAKEN, f"non_json_http_{sc}")
+            return CheckResult(username, CheckStatus.ERROR, "no_response")
 
-        if data is not None:
-            # IP block?
-            infra = self._check_infra_block(username, data)
-            if infra is not None:
-                return infra
-            return self._classify_signup_response(username, data, sc)
+        # Infra block?
+        infra = self._check_infra_block(username, data)
+        if infra is not None:
+            return infra
 
-        # Non-JSON -> Instagram javob berdi lekin JSON emas -> TAKEN
-        if sc > 0:
-            logger.info("[@%s] HTTP %d non-JSON -> TAKEN", username, sc)
-            return CheckResult(
-                username, CheckStatus.TAKEN, f"non_json_http_{sc}"
-            )
+        # User data mavjud?
+        user_data = None
+        if isinstance(data.get("data"), dict):
+            user_data = data["data"].get("user")
+        elif "user" in data:
+            user_data = data.get("user")
 
-        return CheckResult(username, CheckStatus.ERROR, "no_response")
+        if user_data and isinstance(user_data, dict):
+            # Profil mavjud -> TAKEN
+            uname = user_data.get("username", username)
+            logger.info("[@%s] TAKEN (web_profile_info user found)", uname)
+            return CheckResult(username, CheckStatus.TAKEN, "profile_exists")
+
+        # User null / yo'q -> AVAILABLE
+        if user_data is None:
+            # "status": "ok" bilan birga user null -> profil yo'q
+            if data.get("status") == "ok":
+                logger.info("[@%s] AVAILABLE (user=null, status=ok)", username)
+                return CheckResult(username, CheckStatus.AVAILABLE, "truly_available")
+
+        # status: fail -> rate limit, AVAILABLE yoki TAKEN
+        if data.get("status") == "fail":
+            msg = str(data.get("message", ""))
+            msg_lower = msg.lower()
+            # Rate limit? ("Please wait a few minutes before you try again")
+            if "wait" in msg_lower or "try again" in msg_lower or "few minutes" in msg_lower:
+                logger.warning("[@%s] web_profile_info rate limit: %s", username, msg[:60])
+                return CheckResult(username, CheckStatus.ERROR, "api_rate_limit")
+            # User not found -> AVAILABLE
+            if "not found" in msg_lower or "user" in msg_lower:
+                logger.info("[@%s] AVAILABLE (status=fail, user not found)", username)
+                return CheckResult(username, CheckStatus.AVAILABLE, "truly_available")
+            logger.info("[@%s] TAKEN (status=fail) | %s", username, msg[:60])
+            return CheckResult(username, CheckStatus.TAKEN, "api_fail")
+
+        # Konservativ
+        logger.info("[@%s] TAKEN (konservativ) | body=%s", username, str(data)[:120])
+        return CheckResult(username, CheckStatus.TAKEN, "api_rejected_unknown")
+
+    # ------------------------------------------------------------------
+    # Phase C — Mobile API POST fallback (agar web_profile_info 429 bersa)
+    # ------------------------------------------------------------------
+
+    async def _phase_c_mobile_post(self, username: str) -> CheckResult:
+        """
+        Fallback: POST to i.instagram.com/api/v1/users/check_username/
+        Faqat Phase B 429 bo'lganda chaqiriladi.
+        """
+        session_kwargs: dict[str, Any] = {
+            "impersonate": _IMPERSONATE,
+            "timeout": _MOBILE_TIMEOUT,
+        }
+        if self._proxy:
+            session_kwargs["proxy"] = self._proxy
+
+        try:
+            async with AsyncSession(**session_kwargs) as session:
+                resp = await session.post(
+                    _MOBILE_CHECK_URL,
+                    headers={
+                        "User-Agent": _INSTAGRAM_ANDROID_UA,
+                        "X-IG-App-ID": _MOBILE_APP_ID,
+                        "Accept": "*/*",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "X-IG-Connection-Type": "WIFI",
+                    },
+                    data={"username": username},
+                )
+        except _CURL_NETWORK_EXCEPTIONS as exc:
+            logger.warning("[@%s] Mobile POST xato: %s", username, exc)
+            return CheckResult(username, CheckStatus.ERROR, f"mobile_net_{type(exc).__name__}")
+        except Exception as exc:
+            logger.warning("[@%s] Mobile POST kutilmagan: %s", username, exc)
+            return CheckResult(username, CheckStatus.ERROR, f"mobile_err_{type(exc).__name__}")
+
+        sc = int(getattr(resp, "status_code", 0) or 0)
+        if sc == 429:
+            logger.warning("[@%s] Mobile POST 429", username)
+            return CheckResult(username, CheckStatus.ERROR, "mobile_429")
+
+        data = _safe_json(resp)
+        if data is None:
+            if sc > 0:
+                return CheckResult(username, CheckStatus.TAKEN, f"non_json_http_{sc}")
+            return CheckResult(username, CheckStatus.ERROR, "no_response")
+
+        infra = self._check_infra_block(username, data)
+        if infra is not None:
+            return infra
+
+        available = data.get("available")
+        if available is True:
+            logger.info("[@%s] AVAILABLE (mobile POST confirmed)", username)
+            return CheckResult(username, CheckStatus.AVAILABLE, "truly_available")
+        if available is False:
+            et = str(data.get("error_type", "username_is_taken"))
+            logger.info("[@%s] TAKEN (mobile, %s)", username, et)
+            return CheckResult(username, CheckStatus.TAKEN, et)
+
+        if data.get("status") == "fail":
+            et = str(data.get("error_type", "unknown"))
+            logger.info("[@%s] TAKEN (mobile fail, %s)", username, et)
+            return CheckResult(username, CheckStatus.TAKEN, f"fail_{et}")
+
+        logger.info("[@%s] TAKEN (mobile konservativ)", username)
+        return CheckResult(username, CheckStatus.TAKEN, "api_rejected_unknown")
 
     # ------------------------------------------------------------------
     # Infra block detection
@@ -609,89 +630,11 @@ class InstagramChecker:
             et = str(data.get("error_type", ""))
             if et in _INFRA_ERROR_TYPES:
                 logger.warning("[@%s] IG block: %s", username, et)
-                return CheckResult(
-                    username, CheckStatus.ERROR, f"ig_block_{et}"
-                )
+                return CheckResult(username, CheckStatus.ERROR, f"ig_block_{et}")
         if data.get("checkpoint_url") or data.get("lock"):
             logger.warning("[@%s] Checkpoint detected", username)
-            return CheckResult(
-                username, CheckStatus.ERROR, "ig_block_checkpoint"
-            )
+            return CheckResult(username, CheckStatus.ERROR, "ig_block_checkpoint")
         return None
-
-    # ------------------------------------------------------------------
-    # Response classification
-    # ------------------------------------------------------------------
-
-    def _classify_signup_response(
-        self,
-        username: str,
-        data: dict[str, Any],
-        http_status: int,
-    ) -> CheckResult:
-        """
-        Signup attempt JSON -> AVAILABLE yoki TAKEN.
-        Hech qachon ERROR qaytarmaydi.
-
-        1) errors.username mavjud -> TAKEN.
-        2) errors dict lekin username yo'q/bo'sh -> AVAILABLE.
-        3) available: true/false -> mos status.
-        4) Boshqa -> TAKEN (konservativ).
-        """
-        errors = data.get("errors")
-
-        if isinstance(errors, dict):
-            ue = errors.get("username")
-            if isinstance(ue, list) and len(ue) > 0:
-                code = "username_error"
-                msg = ""
-                for err in ue:
-                    if isinstance(err, dict):
-                        code = err.get("code", "username_error")
-                        msg = err.get("message", "")
-                        break
-                    elif isinstance(err, str):
-                        msg = err
-                        if "taken" in err.lower() or "available" in err.lower():
-                            code = "username_is_taken"
-                        elif "invalid" in err.lower():
-                            code = "invalid_username"
-                        break
-                logger.info("[@%s] TAKEN (%s) | %s", username, code, msg[:60])
-                return CheckResult(username, CheckStatus.TAKEN, code)
-
-            # Username errors yo'q -> AVAILABLE
-            logger.info("[@%s] AVAILABLE (signup confirmed)", username)
-            return CheckResult(
-                username, CheckStatus.AVAILABLE, "truly_available"
-            )
-
-        # Fallback: available field
-        if data.get("available") is True:
-            logger.info("[@%s] AVAILABLE (available=true)", username)
-            return CheckResult(
-                username, CheckStatus.AVAILABLE, "truly_available"
-            )
-        if data.get("available") is False:
-            logger.info("[@%s] TAKEN (available=false)", username)
-            return CheckResult(
-                username, CheckStatus.TAKEN, "username_is_taken"
-            )
-
-        # username_suggestions -> TAKEN
-        sug = data.get("username_suggestions")
-        if isinstance(sug, list) and len(sug) > 0:
-            logger.info("[@%s] TAKEN (suggestions)", username)
-            return CheckResult(
-                username, CheckStatus.TAKEN, "username_is_taken"
-            )
-
-        # Konservativ
-        logger.info(
-            "[@%s] TAKEN (konservativ) | http=%d body=%s",
-            username, http_status, str(data)[:120],
-        )
-        return CheckResult(username, CheckStatus.TAKEN, "api_rejected_unknown")
 
 
 # ---------------------------------------------------------------------------
