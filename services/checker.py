@@ -65,17 +65,19 @@ _BOT_HEADERS: dict[str, str] = {
 _WEB_CREATE_AJAX_URL = (
     "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
 )
-_WEB_API_TIMEOUT = 12.0
+_IG_HOMEPAGE_URL = "https://www.instagram.com/"
+_WEB_API_TIMEOUT = 15.0
 _IMPERSONATE = "chrome124"
+_PROXY_RETRY_DELAY = 1.0  # SOCKS5 xatosida qayta urinish oldin kutish
 
 _CHROME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
+# X-CSRFToken — dinamik olinadi (GET / dan cookie orqali)
 _WEB_SIGNUP_HEADERS: dict[str, str] = {
     "User-Agent": _CHROME_USER_AGENT,
-    "X-CSRFToken": "missing",
     "X-Instagram-AJAX": "1",
     "X-Requested-With": "XMLHttpRequest",
     "Referer": "https://www.instagram.com/accounts/emailsignup/",
@@ -424,7 +426,7 @@ class InstagramChecker:
     ) -> CheckResult:
         """
         POST web_create_ajax/attempt/ via curl_cffi (Chrome TLS fingerprint).
-        DataImpulse proksi orqali. No session/cookie required.
+        DataImpulse proksi orqali. CSRF token avtomatik olinadi.
 
         QATIY:
           dryrun_passed: true (username xatosi yo'q) -> AVAILABLE
@@ -450,20 +452,64 @@ class InstagramChecker:
         if self._proxy:
             session_kwargs["proxy"] = self._proxy
 
-        try:
-            async with AsyncSession(**session_kwargs) as session:
-                resp = await session.post(
-                    _WEB_CREATE_AJAX_URL,
-                    headers=_WEB_SIGNUP_HEADERS,
-                    data=form_data,
-                )
-        except _CURL_NETWORK_EXCEPTIONS as exc:
-            detail = f"signup_network_{type(exc).__name__}"
-            logger.warning("[@%s] Web Signup xato: %s", username, exc)
-            return CheckResult(username, CheckStatus.ERROR, detail)
-        except Exception as exc:
-            detail = f"signup_unexpected_{type(exc).__name__}"
-            logger.warning("[@%s] Web Signup kutilmagan: %s", username, exc)
+        # SOCKS5 retry: 2 urinish (proxy uzilsa 1s kutib qayta)
+        max_proxy_retries = 2
+        last_exc: Exception | None = None
+
+        for proxy_attempt in range(1, max_proxy_retries + 1):
+            try:
+                async with AsyncSession(**session_kwargs) as session:
+                    # 1) CSRF token olish: GET instagram.com
+                    await session.get(
+                        _IG_HOMEPAGE_URL,
+                        headers={"User-Agent": _CHROME_USER_AGENT},
+                    )
+                    csrf_token = session.cookies.get("csrftoken", "missing")
+
+                    # 2) POST headerlarni CSRF bilan tayyorlash
+                    post_headers = dict(_WEB_SIGNUP_HEADERS)
+                    post_headers["X-CSRFToken"] = csrf_token
+
+                    # 3) Signup dryrun POST
+                    resp = await session.post(
+                        _WEB_CREATE_AJAX_URL,
+                        headers=post_headers,
+                        data=form_data,
+                    )
+                # Muvaffaqiyat — loopdan chiqamiz
+                break
+
+            except _CURL_NETWORK_EXCEPTIONS as exc:
+                last_exc = exc
+                if proxy_attempt < max_proxy_retries:
+                    logger.warning(
+                        "[@%s] Proksi/SOCKS5 xato (urinish %d/%d), %gs kutib qayta: %s",
+                        username, proxy_attempt, max_proxy_retries,
+                        _PROXY_RETRY_DELAY, exc,
+                    )
+                    await asyncio.sleep(_PROXY_RETRY_DELAY)
+                    continue
+                detail = f"signup_network_{type(exc).__name__}"
+                logger.warning("[@%s] Web Signup xato (barcha urinishlar): %s", username, exc)
+                return CheckResult(username, CheckStatus.ERROR, detail)
+
+            except Exception as exc:
+                last_exc = exc
+                if proxy_attempt < max_proxy_retries:
+                    logger.warning(
+                        "[@%s] Kutilmagan xato (urinish %d/%d), %gs kutib qayta: %s",
+                        username, proxy_attempt, max_proxy_retries,
+                        _PROXY_RETRY_DELAY, exc,
+                    )
+                    await asyncio.sleep(_PROXY_RETRY_DELAY)
+                    continue
+                detail = f"signup_unexpected_{type(exc).__name__}"
+                logger.warning("[@%s] Web Signup kutilmagan (barcha): %s", username, exc)
+                return CheckResult(username, CheckStatus.ERROR, detail)
+        else:
+            # for-else: barcha urinishlar muvaffaqiyatsiz
+            detail = f"signup_all_retries_failed"
+            logger.warning("[@%s] Web Signup: barcha %d urinish xato", username, max_proxy_retries)
             return CheckResult(username, CheckStatus.ERROR, detail)
 
         sc = int(getattr(resp, "status_code", 0) or 0)
