@@ -1,23 +1,24 @@
-"""Instagram username availability checker — i.instagram.com API endpoint.
+"""Instagram username availability checker — Web HTML scraping.
 
 Architecture:
   Tier 1  — Regex / syntax / reserved pre-validation (no network).
-  Tier 2  — i.instagram.com API endpoint check:
-             GET https://i.instagram.com/api/v1/users/web_profile_info/?username={username}
-             via curl_cffi (Mobile Safari TLS fingerprint).
+  Tier 2  — Web HTML scraping:
+             GET https://www.instagram.com/{username}/
+             via curl_cffi (Chrome124 TLS fingerprint).
 
-             HTTP 200 + user data in JSON            → TAKEN (active profile)
-             HTTP 404 + "user_not_found"              → AVAILABLE (truly available)
-             HTTP 404 + checkpoint/disabled indicators → TAKEN (banned/disabled)
-             HTTP 400/401/403                          → TAKEN (restricted/banned)
-             HTTP 429/302                              → ERROR (rate limited/redirect)
+             HTTP 404                              → AVAILABLE
+             HTTP 200 + "page not found" / "isn't available" → AVAILABLE
+             HTTP 200 + profile signals (followers, posts, etc.) → TAKEN
+             HTTP 200 + empty shell (no signals, no not found) → AVAILABLE
+             HTTP 302 / 429                        → ERROR (retry)
+             Other status codes                    → ERROR (never TAKEN)
 
-ANONIM REJIM: Hech qanday POST, session, CSRF ishlatilmaydi.
-Faqat bitta GET so'rov — mobil brauzer kabi.
+ANONIM REJIM: Hech qanday POST, session, CSRF, API key ishlatilmaydi.
+Faqat bitta GET so'rov — brauzer kabi.
 
-I.INSTAGRAM.COM API AFZALLIGI:
-  Web scraping'dagi bo'sh React qobiq muammosi yo'q.
-  API endpoint aniq JSON qaytaradi — klassifikatsiya 100% aniq.
+CHROME124 AFZALLIGI:
+  Chrome124 impersonation bilan Instagram javobini to'g'ri klassifikatsiya qilish.
+  Bo'sh React qobiqlarini AVAILABLE deb belgilash (not TAKEN).
 """
 from __future__ import annotations
 
@@ -48,26 +49,24 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_API_URL_TPL = "https://i.instagram.com/api/v1/users/web_profile_info/?username={}"
-_PAGE_TIMEOUT = 10.0
+_PROFILE_URL_TPL = "https://www.instagram.com/{}/"
+_PAGE_TIMEOUT = 12.0
 _PROXY_RETRY_DELAY = 1.0
 
-# Mobile Safari impersonate profili
-_IMPERSONATE = "safari17_2_ios"
-_IMPERSONATE_FALLBACK = "safari15_3"
+# Chrome124 impersonate profili
+_IMPERSONATE = "chrome124"
+_IMPERSONATE_FALLBACK = "chrome120"
 
-_MOBILE_USER_AGENT = (
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
-    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 "
-    "Mobile/15E148 Safari/604.1"
+_DESKTOP_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 "
+    "Safari/537.36"
 )
 
-_API_HEADERS: dict[str, str] = {
-    "User-Agent": _MOBILE_USER_AGENT,
-    "X-IG-App-ID": "936619743392459",
-    "Accept": "*/*",
+_BROWSER_HEADERS: dict[str, str] = {
+    "User-Agent": _DESKTOP_USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Origin": "https://www.instagram.com",
 }
 
 # Network exceptions
@@ -77,11 +76,10 @@ _CURL_NETWORK_EXCEPTIONS = (
 )
 
 # Tier-1 pre-validation
-_INVALID_SYNTAX_RE = re.compile(r"^\.|\.\.|\.$ |[^a-zA-Z0-9._]")
+_INVALID_SYNTAX_RE = re.compile(r"^\.|\.\.|\.$|[^a-zA-Z0-9._]")
 _RESERVED_NAMES: frozenset[str] = frozenset({
-    "admin", "instagram", "support", "help", "contact", "root",
-    "login", "signup", "accounts", "explore", "direct", "security",
-    "about", "developer", "meta", "privacy", "terms", "settings", "profile",
+    "admin", "instagram", "support", "help", "login", "signup",
+    "accounts", "explore", "direct", "security", "about", "developer",
 })
 
 
@@ -115,11 +113,11 @@ class CheckResult:
 # ---------------------------------------------------------------------------
 
 def _resolve_impersonate() -> str:
-    """curl_cffi safari17_2_ios ni qo'llab-quvvatlashini tekshirish."""
+    """curl_cffi chrome124 ni qo'llab-quvvatlashini tekshirish."""
     try:
         # Sinov: AsyncSession yaratib ko'ramiz
         import curl_cffi.requests
-        # curl_cffi versiyalariga qarab safari profillari mavjud bo'lmasligi mumkin
+        # curl_cffi versiyalariga qarab chrome profillari mavjud bo'lmasligi mumkin
         # Agar xato bo'lsa, fallback ishlatamiz
         return _IMPERSONATE
     except Exception:
@@ -132,21 +130,22 @@ def _resolve_impersonate() -> str:
 
 class InstagramChecker:
     """
-    Anonim Instagram username availability checker — i.instagram.com API.
+    Anonim Instagram username availability checker — Web HTML scraping.
 
-    Faqat bitta GET so'rov: /api/v1/users/web_profile_info/?username={username}
-    Hech qanday POST, session, CSRF ishlatilmaydi.
+    Faqat bitta GET so'rov: /{username}/
+    Hech qanday POST, session, CSRF, API key ishlatilmaydi.
 
-    I.INSTAGRAM.COM API REJIMI:
-      i.instagram.com API endpoint aniq JSON qaytaradi.
-      Web scraping'dagi bo'sh React qobiq muammosi yo'q.
+    CHROME124 REJIMI:
+      Chrome124 impersonation bilan Instagram javobini to'g'ri klassifikatsiya qilish.
+      Bo'sh React qobiqlarini AVAILABLE deb belgilash (not TAKEN).
 
     TEMIR QONUNLAR:
-      200 + user data in JSON              → TAKEN (faol profil)
-      404 + "user_not_found"                → AVAILABLE (haqiqiy bo'sh nom)
-      404 + checkpoint/disabled indicators  → TAKEN (banned/disabled)
-      400/401/403                           → TAKEN (restricted/banned)
-      429/302                               → ERROR (rate limited/redirect)
+      404                              → AVAILABLE (haqiqiy bo'sh nom)
+      200 + "page not found" / "isn't available" → AVAILABLE
+      200 + profile signals            → TAKEN (faol profil)
+      200 + empty shell                → AVAILABLE (bo'sh qobiq)
+      302 / 429                        → ERROR (rate limited/redirect)
+      Other status codes               → ERROR (hech qachon TAKEN emas)
     """
 
     def __init__(self, proxy_url: str | None = None) -> None:
@@ -157,7 +156,7 @@ class InstagramChecker:
         self._impersonate: str = _resolve_impersonate()
 
         logger.info(
-            "InstagramChecker ready (i.instagram.com API + curl_cffi) | "
+            "InstagramChecker ready (Web HTML scraping + curl_cffi) | "
             "proxy=%s | impersonate=%s",
             bool(self._proxy), self._impersonate,
         )
@@ -167,7 +166,7 @@ class InstagramChecker:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        logger.info("InstagramChecker started (Mobile Safari GET, no POST)")
+        logger.info("InstagramChecker started (Web HTML scraping, no POST)")
 
     async def stop(self) -> None:
         logger.info("InstagramChecker stopped.")
@@ -265,19 +264,20 @@ class InstagramChecker:
 
     async def _single_get_check(self, username: str) -> CheckResult:
         """
-        GET https://i.instagram.com/api/v1/users/web_profile_info/?username={username}
+        GET https://www.instagram.com/{username}/
 
-        Mobile Safari UA bilan so'rov yuborish.
-        i.instagram.com API endpoint aniq JSON qaytaradi.
+        Chrome124 UA bilan so'rov yuborish.
+        HTML scraping bilan klassifikatsiya qilish.
 
         TEMIR QONUNLAR:
-          200 + user data in JSON              → TAKEN (faol profil)
-          404 + "user_not_found"                → AVAILABLE (haqiqiy bo'sh nom)
-          404 + checkpoint/disabled indicators  → TAKEN (banned/disabled)
-          400/401/403                           → TAKEN (restricted/banned)
-          429/302                               → ERROR (rate limited/redirect)
+          404                              → AVAILABLE (haqiqiy bo'sh nom)
+          200 + "page not found" / "isn't available" → AVAILABLE
+          200 + profile signals            → TAKEN (faol profil)
+          200 + empty shell                → AVAILABLE (bo'sh qobiq)
+          302 / 429                        → ERROR (rate limited/redirect)
+          Other status codes               → ERROR (hech qachon TAKEN emas)
         """
-        url = _API_URL_TPL.format(username)
+        url = _PROFILE_URL_TPL.format(username)
 
         session_kwargs: dict[str, Any] = {
             "timeout": _PAGE_TIMEOUT,
@@ -293,10 +293,6 @@ class InstagramChecker:
         if self._proxy:
             session_kwargs["proxy"] = self._proxy
 
-        # Dynamic headers with username-specific referer
-        headers = _API_HEADERS.copy()
-        headers["Referer"] = f"https://www.instagram.com/{username}/"
-
         # Proksi retry: 2 urinish
         max_proxy_retries = 2
         resp = None
@@ -306,7 +302,7 @@ class InstagramChecker:
                 async with AsyncSession(**session_kwargs) as session:
                     resp = await session.get(
                         url,
-                        headers=headers,
+                        headers=_BROWSER_HEADERS,
                         allow_redirects=False,
                     )
                 break
@@ -364,23 +360,16 @@ class InstagramChecker:
 
         sc = int(getattr(resp, "status_code", 0) or 0)
 
-        # ── 200: JSON tahlil ───────────────────────────────────────
-        if sc == 200:
-            return self._classify_200_response(username, resp)
-
-        # ── 404: JSON tahlil ───────────────────────────────────────
+        # ── 404 → AVAILABLE ───────────────────────────────────────
         if sc == 404:
-            return self._classify_404_response(username, resp)
-
-        # ── 400/401/403 → TAKEN (restricted/banned) ───────────────
-        if sc in (400, 401, 403):
-            logger.info(
-                "[@%s] TAKEN (HTTP %d — restricted or banned)",
-                username, sc,
-            )
+            logger.info("[@%s] AVAILABLE (HTTP 404)", username)
             return CheckResult(
-                username, CheckStatus.TAKEN, "restricted_or_banned"
+                username, CheckStatus.AVAILABLE, "not_found_404"
             )
+
+        # ── 200: HTML tahlil ───────────────────────────────────────
+        if sc == 200:
+            return self._classify_html_response(username, resp)
 
         # ── 429 → ERROR ───────────────────────────────────────────
         if sc == 429:
@@ -405,94 +394,74 @@ class InstagramChecker:
                 username, CheckStatus.ERROR, "rate_limit_or_redirect"
             )
 
-        # ── Boshqa status kodlar → ERROR ───────────────────────────
+        # ── Boshqa status kodlar → ERROR (hech qachon TAKEN emas) ────
         logger.warning("[@%s] Kutilmagan HTTP %d -> ERROR", username, sc)
         return CheckResult(
             username, CheckStatus.ERROR, f"unexpected_http_{sc}"
         )
 
     # ------------------------------------------------------------------
-    # HTTP 200 klassifikatsiya (i.instagram.com API)
+    # HTTP 200 HTML klassifikatsiya (Web scraping)
     # ------------------------------------------------------------------
 
-    def _classify_200_response(self, username: str, resp: Any) -> CheckResult:
+    def _classify_html_response(self, username: str, resp: Any) -> CheckResult:
         """
-        HTTP 200 javobni klassifikatsiya qilish (i.instagram.com API).
+        HTTP 200 javobni klassifikatsiya qilish (Web HTML scraping).
 
         Mantiq:
-          - user data JSON ichida bo'lsa → TAKEN (faol profil)
-          - user data yo'q bo'lsa → AVAILABLE (anomaliya)
+          1) "page not found" / "isn't available" → AVAILABLE
+          2) Profile signals (followers, posts, etc.) → TAKEN
+          3) Empty shell (no signals, no not found) → AVAILABLE
         """
+        clean_user = username.lower()
+        
+        # HTML olish
+        html = ""
         try:
-            data = resp.json()
-            user = data.get("data", {}).get("user")
-            if user:
-                logger.info(
-                    "[@%s] TAKEN (profile_exists — user data in JSON, HTTP 200)",
-                    username,
-                )
-                return CheckResult(
-                    username, CheckStatus.TAKEN, "profile_exists"
-                )
-            # Anomaliya: 200 lekin user data yo'q
-            logger.warning(
-                "[@%s] AVAILABLE (HTTP 200 but no user data — anomaly)",
-                username,
-            )
-            return CheckResult(
-                username, CheckStatus.AVAILABLE, "anomaly_200_no_user"
-            )
-        except Exception as exc:
-            logger.warning(
-                "[@%s] JSON parse error on HTTP 200: %s", username, exc,
-            )
-            return CheckResult(
-                username, CheckStatus.ERROR, "json_parse_error"
-            )
-
-    # ------------------------------------------------------------------
-    # HTTP 404 klassifikatsiya (i.instagram.com API)
-    # ------------------------------------------------------------------
-
-    def _classify_404_response(self, username: str, resp: Any) -> CheckResult:
-        """
-        HTTP 404 javobni klassifikatsiya qilish (i.instagram.com API).
-
-        Mantiq:
-          - "user_not_found" message → AVAILABLE (haqiqiy bo'sh nom)
-          - Boshqa xabarlar → TAKEN (banned/disabled/checkpoint)
-        """
-        try:
-            res_json = resp.json()
-            message = res_json.get("message", "").lower()
-            
-            # Agar explicitly "user_not_found" bo'lsa → AVAILABLE
-            if message == "user_not_found":
-                logger.info(
-                    "[@%s] AVAILABLE (HTTP 404 + user_not_found)",
-                    username,
-                )
-                return CheckResult(
-                    username, CheckStatus.AVAILABLE, "user_not_found"
-                )
-            
-            # Boshqa 404 javoblari (checkpoint, disabled, etc.) → TAKEN
-            logger.info(
-                "[@%s] TAKEN (HTTP 404 + %s — banned/disabled/checkpoint)",
-                username, message[:50],
-            )
-            return CheckResult(
-                username, CheckStatus.TAKEN, "account_disabled_or_banned"
-            )
+            html = str(getattr(resp, "text", "") or "")
         except Exception:
-            # Fallback: plain 404 HTML/text
+            pass
+        
+        body = html.lower()
+        
+        # ── 1) "Page Not Found" / "isn't available" → AVAILABLE ────
+        not_found_phrases = (
+            "page not found",
+            "isn't available",
+            "the link you followed may be broken",
+        )
+        if any(phrase in body for phrase in not_found_phrases):
             logger.info(
-                "[@%s] AVAILABLE (HTTP 404 — non-JSON response)",
+                "[@%s] AVAILABLE (HTTP 200 + not-found phrase in body)",
                 username,
             )
             return CheckResult(
-                username, CheckStatus.AVAILABLE, "not_found_404"
+                username, CheckStatus.AVAILABLE, "page_not_found_200"
             )
+        
+        # ── 2) Profile signals → TAKEN (faol profil) ────────────────
+        has_stats = "followers" in body and "posts" in body
+        has_profile_title = "photos and videos" in body or f"(@{clean_user})" in body
+        has_og = "og:title" in html and clean_user in html
+        
+        if has_stats or has_profile_title or has_og:
+            logger.info(
+                "[@%s] TAKEN (profile_exists — signals in HTML, HTTP 200)",
+                username,
+            )
+            return CheckResult(
+                username, CheckStatus.TAKEN, "profile_exists"
+            )
+        
+        # ── 3) Empty shell (no signals, no not found) → AVAILABLE ────
+        # Bu bo'sh React qobiq - Instagram mavjud bo'lmagan sahifalarga shunday qaytaradi
+        logger.info(
+            "[@%s] AVAILABLE (HTTP 200 + empty shell — no profile signals)",
+            username,
+        )
+        return CheckResult(
+            username, CheckStatus.AVAILABLE, "empty_shell_200"
+        )
 
 
 # ---------------------------------------------------------------------------
