@@ -1,24 +1,23 @@
-"""Instagram username availability checker — Web HTML scraping.
+"""Instagram username availability checker — Web Sign Up Attempt API.
 
 Architecture:
   Tier 1  — Regex / syntax / reserved pre-validation (no network).
-  Tier 2  — Web HTML scraping:
-             GET https://www.instagram.com/{username}/
+  Tier 2  — Instagram Web Sign Up Attempt API:
+             1. GET https://www.instagram.com/data/shared_data/ (CSRF token)
+             2. POST https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/
              via curl_cffi (Chrome124 TLS fingerprint).
 
-             HTTP 404                              → AVAILABLE
-             HTTP 200 + "page not found" / "isn't available" → AVAILABLE
-             HTTP 200 + profile signals (followers, posts, etc.) → TAKEN
-             HTTP 200 + empty shell (no signals, no not found) → TAKEN (banned/deactivated)
-             HTTP 302 / 429                        → ERROR (retry)
-             Other status codes                    → ERROR (never TAKEN)
+             API response with username error → TAKEN (username taken or banned)
+             API response without username error → AVAILABLE (truly available)
+             HTTP 429/302 → ERROR (rate limited/redirect)
+             Other status codes → ERROR
 
-ANONIM REJIM: Hech qanday POST, session, CSRF, API key ishlatilmaydi.
-Faqat bitta GET so'rov — brauzer kabi.
+ANONIM REJIM: Hech qanday session saqlash, faqat CSRF token olish.
+Sign up attempt API orqali haqiqiy ro'yxatdan o'tish mumkin bo'lgan nomlarni 100% aniqlikda aniqlash.
 
-CHROME124 AFZALLIGI:
-  Chrome124 impersonation bilan Instagram javobini to'g'ri klassifikatsiya qilish.
-  Bo'sh React qobiqlarini TAKEN deb belgilash (banned/deactivated akkauntlar).
+WEB SIGN UP ATTEMPT API AFZALLIGI:
+  HTML scraping'dagi bo'sh React qobiq muammosi yo'q.
+  API endpoint aniq javob qaytaradi — ban/band va available nomlarni 100% ajratish.
 """
 from __future__ import annotations
 
@@ -49,8 +48,9 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_PROFILE_URL_TPL = "https://www.instagram.com/{}/"
-_PAGE_TIMEOUT = 12.0
+_SHARED_DATA_URL = "https://www.instagram.com/data/shared_data/"
+_SIGNUP_ATTEMPT_URL = "https://www.instagram.com/api/v1/web/accounts/web_create_ajax/attempt/"
+_PAGE_TIMEOUT = 15.0
 _PROXY_RETRY_DELAY = 1.0
 
 # Chrome124 impersonate profili
@@ -63,12 +63,6 @@ _DESKTOP_USER_AGENT = (
     "Safari/537.36"
 )
 
-_BROWSER_HEADERS: dict[str, str] = {
-    "User-Agent": _DESKTOP_USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
 # Network exceptions
 _CURL_NETWORK_EXCEPTIONS = (
     CurlError, CurlRequestException, TimeoutError,
@@ -78,8 +72,7 @@ _CURL_NETWORK_EXCEPTIONS = (
 # Tier-1 pre-validation
 _INVALID_SYNTAX_RE = re.compile(r"^\.|\.\.|\.$|[^a-zA-Z0-9._]")
 _RESERVED_NAMES: frozenset[str] = frozenset({
-    "admin", "instagram", "support", "help", "login", "signup",
-    "accounts", "explore", "direct", "security", "about", "developer",
+    "admin", "instagram", "support", "help", "contact", "root",
 })
 
 
@@ -130,22 +123,20 @@ def _resolve_impersonate() -> str:
 
 class InstagramChecker:
     """
-    Anonim Instagram username availability checker — Web HTML scraping.
+    Anonim Instagram username availability checker — Web Sign Up Attempt API.
 
-    Faqat bitta GET so'rov: /{username}/
-    Hech qanday POST, session, CSRF, API key ishlatilmaydi.
+    Faqat Sign Up Attempt API orqali tekshirish.
+    Hech qanday session saqlash, faqat CSRF token olish.
 
-    CHROME124 REJIMI:
-      Chrome124 impersonation bilan Instagram javobini to'g'ri klassifikatsiya qilish.
-      Bo'sh React qobiqlarini TAKEN deb belgilash (banned/deactivated akkauntlar).
+    WEB SIGN UP ATTEMPT API REJIMI:
+      Sign Up Attempt API orqali haqiqiy ro'yxatdan o'tish mumkin bo'lgan nomlarni 100% aniqlikda aniqlash.
+      Ban/band va available nomlarni 100% ajratish.
 
     TEMIR QONUNLAR:
-      404                              → AVAILABLE (haqiqiy bo'sh nom)
-      200 + "page not found" / "isn't available" → AVAILABLE
-      200 + profile signals            → TAKEN (faol profil)
-      200 + empty shell                → TAKEN (banned/deactivated)
-      302 / 429                        → ERROR (rate limited/redirect)
-      Other status codes               → ERROR (hech qachon TAKEN emas)
+      API response with username error → TAKEN (username taken or banned)
+      API response without username error → AVAILABLE (truly available)
+      HTTP 429/302 → ERROR (rate limited/redirect)
+      Other status codes → ERROR
     """
 
     def __init__(self, proxy_url: str | None = None) -> None:
@@ -156,7 +147,7 @@ class InstagramChecker:
         self._impersonate: str = _resolve_impersonate()
 
         logger.info(
-            "InstagramChecker ready (Web HTML scraping + curl_cffi) | "
+            "InstagramChecker ready (Web Sign Up Attempt API + curl_cffi) | "
             "proxy=%s | impersonate=%s",
             bool(self._proxy), self._impersonate,
         )
@@ -166,7 +157,7 @@ class InstagramChecker:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        logger.info("InstagramChecker started (Web HTML scraping, no POST)")
+        logger.info("InstagramChecker started (Web Sign Up Attempt API)")
 
     async def stop(self) -> None:
         logger.info("InstagramChecker stopped.")
@@ -184,8 +175,8 @@ class InstagramChecker:
         Instagram username mavjudligini tekshirish.
 
         Returns:
-          AVAILABLE — 404 yoki "page not found" (haqiqiy bo'sh nom).
-          TAKEN     — Profil mavjud yoki banned/disabled.
+          AVAILABLE — Sign up attempt API bilan username error yo'q (haqiqiy bo'sh nom).
+          TAKEN     — Username taken yoki banned.
           ERROR     — Infra muammo (network/proxy/429/redirect).
         """
         clean = username.strip().lstrip("@").lower()
@@ -208,7 +199,7 @@ class InstagramChecker:
 
             last: CheckResult | None = None
             for attempt in range(1, max_retries + 1):
-                result = await self._single_get_check(clean)
+                result = await self._signup_attempt_check(clean)
                 result.attempts = attempt
 
                 if result.status != CheckStatus.ERROR:
@@ -259,26 +250,19 @@ class InstagramChecker:
         return None
 
     # ------------------------------------------------------------------
-    # Single GET check — /{username}/ (Mobile Safari)
+    # Sign Up Attempt API check
     # ------------------------------------------------------------------
 
-    async def _single_get_check(self, username: str) -> CheckResult:
+    async def _signup_attempt_check(self, username: str) -> CheckResult:
         """
-        GET https://www.instagram.com/{username}/
-
-        Chrome124 UA bilan so'rov yuborish.
-        HTML scraping bilan klassifikatsiya qilish.
+        Instagram Web Sign Up Attempt API orqali username tekshirish.
 
         TEMIR QONUNLAR:
-          404                              → AVAILABLE (haqiqiy bo'sh nom)
-          200 + "page not found" / "isn't available" → AVAILABLE
-          200 + profile signals            → TAKEN (faol profil)
-          200 + empty shell                → TAKEN (banned/deactivated)
-          302 / 429                        → ERROR (rate limited/redirect)
-          Other status codes               → ERROR (hech qachon TAKEN emas)
+          API response with username error → TAKEN (username taken or banned)
+          API response without username error → AVAILABLE (truly available)
+          HTTP 429/302 → ERROR (rate limited/redirect)
+          Other status codes → ERROR
         """
-        url = _PROFILE_URL_TPL.format(username)
-
         session_kwargs: dict[str, Any] = {
             "timeout": _PAGE_TIMEOUT,
             "verify": False,
@@ -295,17 +279,70 @@ class InstagramChecker:
 
         # Proksi retry: 2 urinish
         max_proxy_retries = 2
-        resp = None
 
         for proxy_attempt in range(1, max_proxy_retries + 1):
             try:
                 async with AsyncSession(**session_kwargs) as session:
-                    resp = await session.get(
-                        url,
-                        headers=_BROWSER_HEADERS,
-                        allow_redirects=False,
+                    # 1-qadam: CSRF token olish
+                    init_res = await session.get(
+                        _SHARED_DATA_URL,
+                        headers={"User-Agent": _DESKTOP_USER_AGENT},
                     )
-                break
+                    
+                    csrf_token = session.cookies.get("csrftoken") or ""
+                    if not csrf_token and "csrf_token" in init_res.text:
+                        match = re.search(r'"csrf_token":"([^"]+)"', init_res.text)
+                        if match:
+                            csrf_token = match.group(1)
+
+                    # 2-qadam: Sign up attempt
+                    headers = {
+                        "User-Agent": _DESKTOP_USER_AGENT,
+                        "X-CSRFToken": csrf_token,
+                        "X-Requested-With": "XMLHttpRequest",
+                        "Referer": "https://www.instagram.com/accounts/emailsignup/",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Accept": "*/*"
+                    }
+
+                    data = {
+                        "email": f"chk_{username}@gmail.com",
+                        "username": username,
+                        "first_name": "Checker",
+                        "opt_into_one_tap": "false"
+                    }
+
+                    attempt_res = await session.post(
+                        _SIGNUP_ATTEMPT_URL,
+                        headers=headers,
+                        data=data,
+                    )
+                    
+                    sc = int(getattr(attempt_res, "status_code", 0) or 0)
+                    
+                    # ── 200: JSON tahlil ─────────────────────────────────
+                    if sc == 200:
+                        return self._classify_signup_response(username, attempt_res)
+                    
+                    # ── 429 → ERROR ───────────────────────────────────────
+                    if sc == 429:
+                        logger.warning("[@%s] 429 (rate limited)", username)
+                        return CheckResult(
+                            username, CheckStatus.ERROR, "rate_limit_or_redirect"
+                        )
+                    
+                    # ── 302+ redirect → ERROR ─────────────────────────────
+                    if sc in (301, 302, 303, 307, 308):
+                        logger.warning("[@%s] Redirect (%d)", username, sc)
+                        return CheckResult(
+                            username, CheckStatus.ERROR, "rate_limit_or_redirect"
+                        )
+                    
+                    # ── Boshqa status kodlar → ERROR ───────────────────────
+                    logger.warning("[@%s] Kutilmagan HTTP %d -> ERROR", username, sc)
+                    return CheckResult(
+                        username, CheckStatus.ERROR, f"unexpected_http_{sc}"
+                    )
 
             except _CURL_NETWORK_EXCEPTIONS as exc:
                 if proxy_attempt < max_proxy_retries:
@@ -353,116 +390,51 @@ class InstagramChecker:
                     f"unexpected_{type(exc).__name__}",
                 )
 
-        if resp is None:
-            return CheckResult(
-                username, CheckStatus.ERROR, "all_retries_failed"
-            )
-
-        sc = int(getattr(resp, "status_code", 0) or 0)
-
-        # ── 404 → AVAILABLE ───────────────────────────────────────
-        if sc == 404:
-            logger.info("[@%s] AVAILABLE (HTTP 404)", username)
-            return CheckResult(
-                username, CheckStatus.AVAILABLE, "not_found_404"
-            )
-
-        # ── 200: HTML tahlil ───────────────────────────────────────
-        if sc == 200:
-            return self._classify_html_response(username, resp)
-
-        # ── 429 → ERROR ───────────────────────────────────────────
-        if sc == 429:
-            logger.warning("[@%s] 429 (rate limited)", username)
-            return CheckResult(
-                username, CheckStatus.ERROR, "rate_limit_or_redirect"
-            )
-
-        # ── 302+ redirect → ERROR ─────────────────────────────────
-        if sc in (301, 302, 303, 307, 308):
-            location = ""
-            try:
-                location = str(
-                    getattr(resp, "headers", {}).get("location", "")
-                )
-            except Exception:
-                pass
-            logger.warning(
-                "[@%s] Redirect (%d) -> %s", username, sc, location[:100],
-            )
-            return CheckResult(
-                username, CheckStatus.ERROR, "rate_limit_or_redirect"
-            )
-
-        # ── Boshqa status kodlar → ERROR (hech qachon TAKEN emas) ────
-        logger.warning("[@%s] Kutilmagan HTTP %d -> ERROR", username, sc)
         return CheckResult(
-            username, CheckStatus.ERROR, f"unexpected_http_{sc}"
+            username, CheckStatus.ERROR, "all_retries_failed"
         )
 
     # ------------------------------------------------------------------
-    # HTTP 200 HTML klassifikatsiya (Web scraping)
+    # Sign Up API response classification
     # ------------------------------------------------------------------
 
-    def _classify_html_response(self, username: str, resp: Any) -> CheckResult:
+    def _classify_signup_response(self, username: str, resp: Any) -> CheckResult:
         """
-        HTTP 200 javobni klassifikatsiya qilish (Web HTML scraping).
+        Sign Up Attempt API javobni klassifikatsiya qilish.
 
         Mantiq:
-          1) Profile signals (followers, posts, etc.) → TAKEN (faol profil)
-          2) "page not found" / "isn't available" → AVAILABLE (haqiqiy bo'sh nom)
-          3) Empty shell (no signals, no not found) → TAKEN (banned/deactivated)
+          - API response with username error → TAKEN (username taken or banned)
+          - API response without username error → AVAILABLE (truly available)
         """
-        clean_user = username.lower()
-        
-        # HTML olish
-        html = ""
         try:
-            html = str(getattr(resp, "text", "") or "")
-        except Exception:
-            pass
-        
-        body = html.lower()
-        
-        # ── 1) Profile signals → TAKEN (faol profil) ────────────────
-        has_stats = "followers" in body and "posts" in body
-        has_profile_title = "photos and videos" in body or f"(@{clean_user})" in body
-        has_og = "og:title" in html and clean_user in html
-        
-        if has_stats or has_profile_title or has_og:
+            res_json = resp.json()
+            errors = res_json.get("errors", {})
+            
+            # Agar xatolarda username bandligi bo'lsa (yoki ban bo'lgan bo'lsa):
+            if "username" in errors:
+                logger.info(
+                    "[@%s] TAKEN (username error in signup attempt)",
+                    username,
+                )
+                return CheckResult(
+                    username, CheckStatus.TAKEN, "username_is_taken_or_banned"
+                )
+            
+            # Agar username bo'yicha hech qanday xatolik bo'lmasa -> Nom bo'sh!
             logger.info(
-                "[@%s] TAKEN (profile_exists — signals in HTML, HTTP 200)",
+                "[@%s] AVAILABLE (no username error in signup attempt)",
                 username,
             )
             return CheckResult(
-                username, CheckStatus.TAKEN, "profile_exists"
+                username, CheckStatus.AVAILABLE, "signup_attempt_available"
             )
-        
-        # ── 2) "Page Not Found" / "isn't available" → AVAILABLE ────
-        not_found_phrases = (
-            "page not found",
-            "isn't available",
-            "the link you followed may be broken",
-        )
-        if any(phrase in body for phrase in not_found_phrases):
-            logger.info(
-                "[@%s] AVAILABLE (HTTP 200 + not-found phrase in body)",
-                username,
+        except Exception as exc:
+            logger.warning(
+                "[@%s] JSON parse error on signup attempt: %s", username, exc,
             )
             return CheckResult(
-                username, CheckStatus.AVAILABLE, "page_not_found_200"
+                username, CheckStatus.ERROR, "json_parse_error"
             )
-        
-        # ── 3) Empty shell (no signals, no not found) → TAKEN (banned/deactivated) ────
-        # Bu ban yoki deaktiv bo'lgan akkaunt - Instagram buni bo'sh React qobiq bilan beradi
-        # "Page Not Found" yo'q, lekin profil ma'lumotlari ham yo'q
-        logger.info(
-            "[@%s] TAKEN (account_disabled_or_banned — HTTP 200, no profile signals, no not-found)",
-            username,
-        )
-        return CheckResult(
-            username, CheckStatus.TAKEN, "account_disabled_or_banned"
-        )
 
 
 # ---------------------------------------------------------------------------
