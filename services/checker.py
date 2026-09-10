@@ -19,6 +19,15 @@ class InstagramChecker:
         self.proxy = proxy
         self.timeout = timeout
 
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+    async def close(self):
+        pass
+
     async def check(self, username: str) -> CheckResult:
         clean_user = username.strip().lower()
 
