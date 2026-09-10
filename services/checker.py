@@ -11,6 +11,7 @@ class UsernameStatus(str, Enum):
 
 @dataclass
 class CheckResult:
+    username: str
     status: UsernameStatus
     reason: Optional[str] = None
 
@@ -28,16 +29,16 @@ class InstagramChecker:
     async def close(self):
         pass
 
-    async def check(self, username: str) -> CheckResult:
+    async def check_username(self, username: str) -> CheckResult:
         clean_user = username.strip().lower()
 
         # 1. Tier 1: Sintaksis va Rezerv qoidalar
         if not re.match(r"^[a-zA-Z0-9._]{1,30}$", clean_user) or clean_user.endswith(".") or ".." in clean_user:
-            return CheckResult(status=UsernameStatus.TAKEN, reason="invalid_syntax")
+            return CheckResult(username=clean_user, status=UsernameStatus.TAKEN, reason="invalid_syntax")
 
         reserved = {"admin", "instagram", "support", "help", "contact", "root", "explore"}
         if clean_user in reserved:
-            return CheckResult(status=UsernameStatus.TAKEN, reason="reserved")
+            return CheckResult(username=clean_user, status=UsernameStatus.TAKEN, reason="reserved")
 
         # 2. Tier 2: Veb HTML tekshiruvi (GET)
         url = f"https://www.instagram.com/{clean_user}/"
@@ -61,7 +62,7 @@ class InstagramChecker:
 
                 # HTTP 404 qaytsa -> 100% bo'sh
                 if response.status_code == 404:
-                    return CheckResult(status=UsernameStatus.AVAILABLE)
+                    return CheckResult(username=clean_user, status=UsernameStatus.AVAILABLE)
 
                 if response.status_code == 200:
                     html = response.text.lower()
@@ -71,7 +72,7 @@ class InstagramChecker:
                     has_profile_title = "photos and videos" in html or f"(@{clean_user})" in html
                     has_og_title = "og:title" in html and clean_user in html
                     if has_stats or has_profile_title or has_og_title:
-                        return CheckResult(status=UsernameStatus.TAKEN, reason="profile_exists")
+                        return CheckResult(username=clean_user, status=UsernameStatus.TAKEN, reason="profile_exists")
 
                     # 2-shart: Haqiqiy mavjud bo'lmagan (Bo'sh) nom
                     not_found_markers = [
@@ -81,19 +82,22 @@ class InstagramChecker:
                         "<title>page not found"
                     ]
                     if any(marker in html for marker in not_found_markers):
-                        return CheckResult(status=UsernameStatus.AVAILABLE)
+                        return CheckResult(username=clean_user, status=UsernameStatus.AVAILABLE)
 
                     # 3-shart: "Page Not Found" yo'q, lekin profil belgilari ham yo'q -> BAN/DEAKTIV
-                    return CheckResult(status=UsernameStatus.TAKEN, reason="account_banned_or_disabled")
+                    return CheckResult(username=clean_user, status=UsernameStatus.TAKEN, reason="account_banned_or_disabled")
 
                 # Cheklovlar yoki qayta yo'naltirish
                 if response.status_code in (429, 302):
-                    return CheckResult(status=UsernameStatus.ERROR, reason="rate_limited_or_redirect")
+                    return CheckResult(username=clean_user, status=UsernameStatus.ERROR, reason="rate_limited_or_redirect")
 
-                return CheckResult(status=UsernameStatus.ERROR, reason=f"http_{response.status_code}")
+                return CheckResult(username=clean_user, status=UsernameStatus.ERROR, reason=f"http_{response.status_code}")
 
         except Exception as e:
-            return CheckResult(status=UsernameStatus.ERROR, reason=str(e))
+            return CheckResult(username=clean_user, status=UsernameStatus.ERROR, reason=str(e))
+
+    async def check(self, username: str) -> CheckResult:
+        return await self.check_username(username)
 
 # Global singleton instansiya
 instagram_checker = InstagramChecker()
