@@ -85,3 +85,6 @@ class InstagramChecker:
 
         except Exception as e:
             return CheckResult(status=UsernameStatus.ERROR, reason=str(e))
+
+# Global singleton instansiya
+instagram_checker = InstagramChecker()
