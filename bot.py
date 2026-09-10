@@ -136,6 +136,13 @@ async def on_startup(bot: Bot) -> None:
         "proxy" if settings.proxy_enabled else "direct",
     )
 
+    # 0. Webhookni o'chirish (conflictni oldini olish uchun)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook muvaffaqiyatli o'chirildi")
+    except Exception as exc:
+        logger.warning("Webhookni o'chirishda xatolik: %s", exc)
+
     # 1. Ma'lumotlar bazasini tekshirish va jadvallarni yaratish
     await init_db()
 
