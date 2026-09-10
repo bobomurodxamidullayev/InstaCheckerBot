@@ -1,15 +1,15 @@
-"""Instagram username availability checker — Single GET (?__a=1&__d=dis).
+"""Instagram username availability checker — Single GET (plain profile URL).
 
 Architecture:
   Tier 1  — Regex / syntax / reserved pre-validation (no network).
   Tier 2  — Single browser-like GET request:
-             GET https://www.instagram.com/{username}/?__a=1&__d=dis
+             GET https://www.instagram.com/{username}/
              via curl_cffi (Chrome TLS fingerprint).
 
              HTTP 404                              → AVAILABLE
-             HTTP 200 + JSON user data             → TAKEN (active)
-             HTTP 200 + HTML profil meta teglari   → TAKEN (active)
-             HTTP 200 + bo'sh "Instagram" qobig'i  → TAKEN (banned/disabled)
+             HTTP 200/201 + HTML profil data       → TAKEN (active)
+             HTTP 200/201 + bo'sh "Instagram" qobig'i → TAKEN (banned/disabled)
+             HTTP 401                              → TAKEN (auth_required)
              HTTP 302 / 429                        → ERROR (qayta urinish)
 
 ANONIM REJIM: Hech qanday POST, session, CSRF, API key ishlatilmaydi.
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_PROFILE_URL_TPL = "https://www.instagram.com/{}/?__a=1&__d=dis"
+_PROFILE_URL_TPL = "https://www.instagram.com/{}/"
 _PAGE_TIMEOUT = 12.0
 _IMPERSONATE = "chrome124"
 _PROXY_RETRY_DELAY = 1.0
@@ -178,13 +178,14 @@ class InstagramChecker:
     """
     Anonim Instagram username availability checker — Single GET.
 
-    Faqat bitta GET so'rov: /{username}/?__a=1&__d=dis
+    Faqat bitta GET so'rov: /{username}/
     Hech qanday POST, session, CSRF, API key ishlatilmaydi.
 
     TEMIR QONUNLAR:
       404                            → AVAILABLE (haqiqiy bo'sh nom)
-      200 + JSON/HTML profil data    → TAKEN (faol akkaunt)
-      200 + bo'sh Instagram qobig'i → TAKEN (banned/disabled)
+      200/201 + HTML profil data     → TAKEN (faol akkaunt)
+      200/201 + bo'sh qobiq          → TAKEN (banned/disabled)
+      401                            → TAKEN (auth_required_profile_exists)
       302 / 429                      → ERROR (proksi IP cheklovi)
     """
 
@@ -297,18 +298,18 @@ class InstagramChecker:
         return None
 
     # ------------------------------------------------------------------
-    # Single GET check — /{username}/?__a=1&__d=dis
+    # Single GET check — /{username}/
     # ------------------------------------------------------------------
 
     async def _single_get_check(self, username: str) -> CheckResult:
         """
-        GET https://www.instagram.com/{username}/?__a=1&__d=dis
+        GET https://www.instagram.com/{username}/
 
         TEMIR QONUNLAR:
           404 → AVAILABLE
-          200 + JSON user data → TAKEN (faol)
-          200 + HTML profil meta → TAKEN (faol)
-          200 + bo'sh qobiq (faqat "Instagram" title) → TAKEN (banned/disabled)
+          200/201 + HTML profil data → TAKEN (faol)
+          200/201 + bo'sh qobiq (faqat "Instagram" title) → TAKEN (banned/disabled)
+          401 → TAKEN (auth_required_profile_exists)
           302 / 429 → ERROR
         """
         url = _PROFILE_URL_TPL.format(username)
@@ -404,9 +405,19 @@ class InstagramChecker:
                 username, CheckStatus.AVAILABLE, "not_found_404"
             )
 
-        # ── 200: JSON yoki HTML tahlil ─────────────────────────────
-        if sc == 200:
-            return self._classify_200(username, resp)
+        # ── 200 / 201: HTML tahlil ─────────────────────────────────
+        if sc in (200, 201):
+            return self._classify_response(username, resp, sc)
+
+        # ── 401 → TAKEN (profil bor, lekin auth talab qilinadi) ────
+        if sc == 401:
+            logger.info(
+                "[@%s] TAKEN (HTTP 401 — auth required, profile exists)",
+                username,
+            )
+            return CheckResult(
+                username, CheckStatus.TAKEN, "auth_required_profile_exists"
+            )
 
         # ── Boshqa status kodlar → ERROR ───────────────────────────
         logger.warning("[@%s] Kutilmagan HTTP %d -> ERROR", username, sc)
@@ -415,17 +426,23 @@ class InstagramChecker:
         )
 
     # ------------------------------------------------------------------
-    # HTTP 200 klassifikatsiya
+    # HTTP 200/201 klassifikatsiya
     # ------------------------------------------------------------------
 
-    def _classify_200(self, username: str, resp: Any) -> CheckResult:
+    def _classify_response(
+        self, username: str, resp: Any, sc: int,
+    ) -> CheckResult:
         """
-        HTTP 200 javobni klassifikatsiya qilish.
+        HTTP 200/201 javobni klassifikatsiya qilish.
 
-        1) JSON + user data       → TAKEN (faol akkaunt)
-        2) HTML + profil meta      → TAKEN (faol akkaunt)
-        3) HTML + bo'sh qobiq      → TAKEN (banned/disabled)
-        4) HTML + "Page Not Found" → AVAILABLE
+        1) JSON + user data                → TAKEN (faol akkaunt)
+        2) HTML body: followers + posts     → TAKEN (faol akkaunt)
+        3) HTML body: "photos and videos"   → TAKEN (faol akkaunt)
+        4) HTML body: (@username)           → TAKEN (faol akkaunt)
+        5) og:title ichida user ma'lumoti   → TAKEN (faol akkaunt)
+        6) HTML + "Page Not Found"          → AVAILABLE
+        7) HTML + login sahifasi            → TAKEN (auth_required)
+        8) HTML + bo'sh qobiq               → TAKEN (banned/disabled)
         """
         ul = username.lower()
 
@@ -444,7 +461,6 @@ class InstagramChecker:
                 )
 
             # JSON bor lekin user null/yo'q → banned/disabled
-            # (Instagram ba'zan JSON qaytaradi lekin user: null)
             if "user" in str(json_data).lower():
                 logger.info(
                     "[@%s] TAKEN (JSON: user key exists but null — banned/disabled)",
@@ -461,14 +477,7 @@ class InstagramChecker:
         except Exception:
             pass
 
-        html_lower = html.lower()
-
-        # Login page redirect (HTML ichida)
-        if "/accounts/login/" in html_lower and len(html) < 5000:
-            logger.warning("[@%s] Login sahifasi (HTML)", username)
-            return CheckResult(
-                username, CheckStatus.ERROR, "login_page_html"
-            )
+        body = html.lower()
 
         # <title> ni olish
         title_m = _TITLE_RE.search(html)
@@ -489,14 +498,23 @@ class InstagramChecker:
         )
         if any(p in title for p in not_found_phrases):
             logger.info(
-                "[@%s] AVAILABLE (HTTP 200 + 'Page Not Found' in title)",
-                username,
+                "[@%s] AVAILABLE (HTTP %d + 'Page Not Found' in title)",
+                username, sc,
             )
             return CheckResult(
-                username, CheckStatus.AVAILABLE, "page_not_found_200"
+                username, CheckStatus.AVAILABLE, f"page_not_found_{sc}"
             )
 
-        # ── Profil signallari → TAKEN ──────────────────────────────
+        # ── Profil signallari (body tahlili) → TAKEN ───────────────
+        # Body ichida "followers" VA "posts" bo'lsa — faol profil
+        has_body_stats = "followers" in body and "posts" in body
+
+        # "photos and videos" — profil sahifasi belgisi
+        has_photos_videos = "photos and videos" in body
+
+        # (@username) body ichida
+        has_at_username_body = f"(@{ul})" in body
+
         # og:title bo'sh bo'lmasa (haqiqiy ism/nom bor)
         has_og_title = bool(og_title)
 
@@ -504,24 +522,43 @@ class InstagramChecker:
         has_meta_stats = "followers" in og_desc and "posts" in og_desc
 
         # title ichida (@username)
-        has_at_username = f"(@{ul})" in title
+        has_at_username_title = f"(@{ul})" in title
 
-        # "photos and videos" — profil sahifasi belgisi
-        has_photos_videos = "photos and videos" in html_lower
-
-        if has_og_title or has_meta_stats or has_at_username or has_photos_videos:
+        if (
+            has_body_stats
+            or has_photos_videos
+            or has_at_username_body
+            or has_at_username_title
+            or has_og_title
+            or has_meta_stats
+        ):
             logger.info(
-                "[@%s] TAKEN (profile_exists) | og_title=%s meta_stats=%s (@user)=%s photos=%s",
-                username, bool(og_title), has_meta_stats,
-                has_at_username, has_photos_videos,
+                "[@%s] TAKEN (profile_exists, HTTP %d) | "
+                "body_stats=%s photos=%s (@body)=%s (@title)=%s "
+                "og_title=%s meta_stats=%s",
+                username, sc,
+                has_body_stats, has_photos_videos,
+                has_at_username_body, has_at_username_title,
+                bool(og_title), has_meta_stats,
             )
             return CheckResult(
                 username, CheckStatus.TAKEN, "profile_exists"
             )
 
-        # ── 200 + hech qanday profil belgisi yo'q ─────────────────
+        # ── Login sahifasi (HTML ichida) → TAKEN ───────────────────
+        # Instagram login so'rasa, demak profil mavjud, lekin
+        # mehmonlarga ko'rsatilmaydi.
+        if "/accounts/login/" in body and len(html) < 5000:
+            logger.info(
+                "[@%s] TAKEN (HTTP %d + login page — auth required, profile exists)",
+                username, sc,
+            )
+            return CheckResult(
+                username, CheckStatus.TAKEN, "auth_required_profile_exists"
+            )
+
+        # ── 200/201 + hech qanday profil belgisi yo'q ─────────────
         # Title faqat "Instagram" yoki bo'sh → BAN / DEACTIVATED
-        # Bu nom AVAILABLE EMAS — akkaunt disabled/banned!
         is_bare_shell = (
             title in ("instagram", "instagram • photos and videos", "")
             or (not has_og_title and not has_meta_stats)
@@ -529,17 +566,17 @@ class InstagramChecker:
 
         if is_bare_shell:
             logger.info(
-                "[@%s] TAKEN (account_disabled — 200 but bare shell) | title=%s",
-                username, title[:60],
+                "[@%s] TAKEN (account_disabled_or_banned — HTTP %d bare shell) | title=%s",
+                username, sc, title[:60],
             )
             return CheckResult(
-                username, CheckStatus.TAKEN, "account_disabled"
+                username, CheckStatus.TAKEN, "account_disabled_or_banned"
             )
 
-        # ── Fallback: noaniq 200 → TAKEN (xavfsiz tomondan) ───────
+        # ── Fallback: noaniq → TAKEN (xavfsiz tomondan) ───────────
         logger.warning(
-            "[@%s] TAKEN (200 noaniq — xavfsiz tomondan) | title=%s | html_len=%d",
-            username, title[:60], len(html),
+            "[@%s] TAKEN (HTTP %d noaniq — xavfsiz tomondan) | title=%s | html_len=%d",
+            username, sc, title[:60], len(html),
         )
         return CheckResult(
             username, CheckStatus.TAKEN, "ambiguous_200_safe"
