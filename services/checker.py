@@ -9,7 +9,7 @@ Architecture:
              HTTP 404                              → AVAILABLE
              HTTP 200 + "page not found" / "isn't available" → AVAILABLE
              HTTP 200 + profile signals (followers, posts, etc.) → TAKEN
-             HTTP 200 + empty shell (no signals, no not found) → AVAILABLE
+             HTTP 200 + empty shell (no signals, no not found) → TAKEN (banned/deactivated)
              HTTP 302 / 429                        → ERROR (retry)
              Other status codes                    → ERROR (never TAKEN)
 
@@ -18,7 +18,7 @@ Faqat bitta GET so'rov — brauzer kabi.
 
 CHROME124 AFZALLIGI:
   Chrome124 impersonation bilan Instagram javobini to'g'ri klassifikatsiya qilish.
-  Bo'sh React qobiqlarini AVAILABLE deb belgilash (not TAKEN).
+  Bo'sh React qobiqlarini TAKEN deb belgilash (banned/deactivated akkauntlar).
 """
 from __future__ import annotations
 
@@ -137,13 +137,13 @@ class InstagramChecker:
 
     CHROME124 REJIMI:
       Chrome124 impersonation bilan Instagram javobini to'g'ri klassifikatsiya qilish.
-      Bo'sh React qobiqlarini AVAILABLE deb belgilash (not TAKEN).
+      Bo'sh React qobiqlarini TAKEN deb belgilash (banned/deactivated akkauntlar).
 
     TEMIR QONUNLAR:
       404                              → AVAILABLE (haqiqiy bo'sh nom)
       200 + "page not found" / "isn't available" → AVAILABLE
       200 + profile signals            → TAKEN (faol profil)
-      200 + empty shell                → AVAILABLE (bo'sh qobiq)
+      200 + empty shell                → TAKEN (banned/deactivated)
       302 / 429                        → ERROR (rate limited/redirect)
       Other status codes               → ERROR (hech qachon TAKEN emas)
     """
@@ -273,7 +273,7 @@ class InstagramChecker:
           404                              → AVAILABLE (haqiqiy bo'sh nom)
           200 + "page not found" / "isn't available" → AVAILABLE
           200 + profile signals            → TAKEN (faol profil)
-          200 + empty shell                → AVAILABLE (bo'sh qobiq)
+          200 + empty shell                → TAKEN (banned/deactivated)
           302 / 429                        → ERROR (rate limited/redirect)
           Other status codes               → ERROR (hech qachon TAKEN emas)
         """
@@ -409,9 +409,9 @@ class InstagramChecker:
         HTTP 200 javobni klassifikatsiya qilish (Web HTML scraping).
 
         Mantiq:
-          1) "page not found" / "isn't available" → AVAILABLE
-          2) Profile signals (followers, posts, etc.) → TAKEN
-          3) Empty shell (no signals, no not found) → AVAILABLE
+          1) Profile signals (followers, posts, etc.) → TAKEN (faol profil)
+          2) "page not found" / "isn't available" → AVAILABLE (haqiqiy bo'sh nom)
+          3) Empty shell (no signals, no not found) → TAKEN (banned/deactivated)
         """
         clean_user = username.lower()
         
@@ -424,7 +424,21 @@ class InstagramChecker:
         
         body = html.lower()
         
-        # ── 1) "Page Not Found" / "isn't available" → AVAILABLE ────
+        # ── 1) Profile signals → TAKEN (faol profil) ────────────────
+        has_stats = "followers" in body and "posts" in body
+        has_profile_title = "photos and videos" in body or f"(@{clean_user})" in body
+        has_og = "og:title" in html and clean_user in html
+        
+        if has_stats or has_profile_title or has_og:
+            logger.info(
+                "[@%s] TAKEN (profile_exists — signals in HTML, HTTP 200)",
+                username,
+            )
+            return CheckResult(
+                username, CheckStatus.TAKEN, "profile_exists"
+            )
+        
+        # ── 2) "Page Not Found" / "isn't available" → AVAILABLE ────
         not_found_phrases = (
             "page not found",
             "isn't available",
@@ -439,28 +453,15 @@ class InstagramChecker:
                 username, CheckStatus.AVAILABLE, "page_not_found_200"
             )
         
-        # ── 2) Profile signals → TAKEN (faol profil) ────────────────
-        has_stats = "followers" in body and "posts" in body
-        has_profile_title = "photos and videos" in body or f"(@{clean_user})" in body
-        has_og = "og:title" in html and clean_user in html
-        
-        if has_stats or has_profile_title or has_og:
-            logger.info(
-                "[@%s] TAKEN (profile_exists — signals in HTML, HTTP 200)",
-                username,
-            )
-            return CheckResult(
-                username, CheckStatus.TAKEN, "profile_exists"
-            )
-        
-        # ── 3) Empty shell (no signals, no not found) → AVAILABLE ────
-        # Bu bo'sh React qobiq - Instagram mavjud bo'lmagan sahifalarga shunday qaytaradi
+        # ── 3) Empty shell (no signals, no not found) → TAKEN (banned/deactivated) ────
+        # Bu ban yoki deaktiv bo'lgan akkaunt - Instagram buni bo'sh React qobiq bilan beradi
+        # "Page Not Found" yo'q, lekin profil ma'lumotlari ham yo'q
         logger.info(
-            "[@%s] AVAILABLE (HTTP 200 + empty shell — no profile signals)",
+            "[@%s] TAKEN (account_disabled_or_banned — HTTP 200, no profile signals, no not-found)",
             username,
         )
         return CheckResult(
-            username, CheckStatus.AVAILABLE, "empty_shell_200"
+            username, CheckStatus.TAKEN, "account_disabled_or_banned"
         )
 
 
