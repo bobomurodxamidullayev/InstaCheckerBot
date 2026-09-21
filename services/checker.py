@@ -1,10 +1,16 @@
 """
-services/checker.py — Authenticated Instagram username availability checker.
+services/checker.py — Cookie-free Instagram username availability checker.
 
-Uses curl_cffi with Chrome 124 browser impersonation and live session
-credentials to query Instagram's web_profile_info endpoint.  A real
-profile response means the handle is TAKEN; a 404 / null-user response
-means the handle is AVAILABLE.
+Uses curl_cffi with Chrome 124 browser impersonation and Instagram's public
+oEmbed API (no authentication required) to deterministically resolve whether
+a handle is TAKEN or AVAILABLE.
+
+Why oEmbed?
+    Instagram's /api/v1/oembed/ endpoint is a stable, public, unauthenticated
+    API that returns profile metadata for existing accounts (HTTP 200) and a
+    clean 404 for non-existent profiles.  It requires no session cookies,
+    CSRF tokens, or login credentials — making it immune to the 401 errors
+    caused by invalidated cookies on data-center IPs.
 
 Integration:
     - CheckResult dataclass and CheckStatus enum are the public interface.
@@ -27,12 +33,6 @@ from models.username_log import CheckStatus
 
 logger = logging.getLogger(__name__)
 
-# ─── Authenticated session credentials ─────────────────────────────────────────
-INSTA_SESSION_ID = (
-    "40137255195%3AdYjlsW9FTWJ9MD%3A19%3A3AAYkrmRfVGsglXHzdexZG6BF4FPHdkYlRnApGfH8Fg"
-)
-INSTA_CSRF_TOKEN = "cUHu0IfNR8e9jfzUlfOreEaXcTldRvp8"
-
 
 # ─── Public data structures ────────────────────────────────────────────────────
 
@@ -50,9 +50,21 @@ class CheckResult:
 
 # ─── Constants ──────────────────────────────────────────────────────────────────
 
-_PROFILE_URL_TEMPLATE = (
-    "https://www.instagram.com/api/v1/users/web_profile_info/?username={}"
+_OEMBED_URL_TEMPLATE = (
+    "https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/{}/"
 )
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.instagram.com/",
+    "Origin": "https://www.instagram.com",
+}
 
 _RESERVED_USERNAMES: frozenset[str] = frozenset({
     "admin", "administrator", "instagram", "support", "help",
@@ -72,15 +84,14 @@ _USERNAME_RE = re.compile(r"^[a-zA-Z0-9._]{1,30}$")
 
 class InstagramChecker:
     """
-    Deterministic, authenticated Instagram username availability checker.
+    Deterministic, cookie-free Instagram username availability checker.
 
-    Uses curl_cffi AsyncSession with Chrome 124 impersonation and injected
-    session cookies so that every request is treated as a logged-in browser
-    interaction.  Queries the ``web_profile_info`` endpoint:
+    Uses curl_cffi AsyncSession with Chrome 124 impersonation and the
+    public oEmbed API — no session cookies or login credentials required.
 
-    * HTTP 200 + valid user object  →  **TAKEN**
-    * HTTP 404 / user is ``None``   →  **AVAILABLE**
-    * Anything else                 →  **ERROR** (retried)
+    * HTTP 200 + valid author metadata  →  **TAKEN**
+    * HTTP 404                          →  **AVAILABLE**
+    * Anything else                     →  **ERROR** (retried)
     """
 
     def __init__(
@@ -95,22 +106,13 @@ class InstagramChecker:
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Initialise the underlying HTTP session with auth cookies."""
+        """Initialise the underlying HTTP session (no cookies needed)."""
         if self._session is not None:
             return
         self._session = AsyncSession(
             impersonate="chrome124",
             proxy=self._proxy,
             timeout=self._timeout,
-        )
-        # Bind authenticated cookies to the session.
-        self._session.cookies.set(
-            "sessionid", INSTA_SESSION_ID,
-            domain=".instagram.com", path="/",
-        )
-        self._session.cookies.set(
-            "csrftoken", INSTA_CSRF_TOKEN,
-            domain=".instagram.com", path="/",
         )
 
     async def stop(self) -> None:
@@ -168,41 +170,28 @@ class InstagramChecker:
 
         return None  # OK — proceed to API check
 
-    # ── Tier 2: Authenticated web_profile_info check ────────────────────────
+    # ── Tier 2: Public oEmbed check (cookie-free) ───────────────────────────
 
     async def _tier2_api_check(self, username: str, start_time: float) -> CheckResult:
         """
-        GET Instagram's ``web_profile_info`` endpoint as an authenticated
-        session to deterministically resolve whether *username* exists.
+        GET Instagram's public ``oEmbed`` endpoint to deterministically
+        resolve whether *username* exists — no cookies or auth required.
 
         Decision matrix
         ───────────────
-        HTTP 200 + user object present  →  TAKEN
-        HTTP 404 / user object is None  →  AVAILABLE
-        HTTP 429                        →  ERROR (rate_limited, retriable)
-        Other / network fault           →  ERROR (retriable)
+        HTTP 200 + author_name/author_id present  →  TAKEN
+        HTTP 404 (profile does not exist)          →  AVAILABLE
+        HTTP 429                                   →  ERROR (rate_limited)
+        Other / network fault                      →  ERROR (retriable)
         """
         session = await self._get_session()
 
-        url = _PROFILE_URL_TEMPLATE.format(username)
-
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "X-IG-App-ID": "936619743392459",
-            "X-CSRFToken": INSTA_CSRF_TOKEN,
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"https://www.instagram.com/{username}/",
-            "Accept": "*/*",
-        }
+        url = _OEMBED_URL_TEMPLATE.format(username)
 
         try:
             resp = await session.get(
                 url,
-                headers=headers,
+                headers=_HEADERS,
                 timeout=self._timeout,
             )
         except Exception as exc:
@@ -249,7 +238,7 @@ class InstagramChecker:
                 response_time=elapsed,
             )
 
-        # ── HTTP 200: parse JSON and inspect user object ────────────────
+        # ── HTTP 200: parse JSON and verify author metadata ─────────────
         try:
             data: dict[str, Any] = resp.json()
         except Exception:
@@ -262,10 +251,11 @@ class InstagramChecker:
                 response_time=elapsed,
             )
 
-        user_obj = data.get("data", {}).get("user")
+        # oEmbed returns {"author_name": "...", "author_id": ..., ...}
+        # for existing profiles.  Verify at least one identifying field.
+        has_author = bool(data.get("author_name") or data.get("author_id"))
 
-        if user_obj is not None:
-            # Profile exists — handle is taken.
+        if has_author:
             return CheckResult(
                 username=username,
                 status=CheckStatus.TAKEN,
@@ -274,7 +264,8 @@ class InstagramChecker:
                 response_time=elapsed,
             )
 
-        # User object is None / missing — handle is available.
+        # 200 but no author metadata — treat as available (edge case for
+        # deactivated / empty profiles that still return a stub response).
         return CheckResult(
             username=username,
             status=CheckStatus.AVAILABLE,
@@ -296,7 +287,7 @@ class InstagramChecker:
 
         Pipeline:
             1. Tier 1 — syntax / reserved pre-validation (instant, no network).
-            2. Tier 2 — authenticated GET to web_profile_info API.
+            2. Tier 2 — public oEmbed API check (cookie-free).
 
         Retries on transient errors (network failures, HTTP 429) up to
         *max_retries* times with incremental back-off.
@@ -309,7 +300,7 @@ class InstagramChecker:
         if precheck is not None:
             return precheck
 
-        # ── Tier 2: authenticated API check (with retries) ──────────────
+        # ── Tier 2: oEmbed API check (with retries) ─────────────────────
         last_result: Optional[CheckResult] = None
 
         for attempt in range(max_retries + 1):
@@ -327,7 +318,7 @@ class InstagramChecker:
                     "Retry %d/%d for @%s (reason=%s), sleeping %.1fs",
                     attempt + 1, max_retries, clean, result.reason, backoff,
                 )
-                # Reset session on rate-limit to cycle cookies / connection.
+                # Reset session on rate-limit to cycle connection.
                 if result.reason == "rate_limited":
                     await self.close()
                 await asyncio.sleep(backoff)
