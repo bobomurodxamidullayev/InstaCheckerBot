@@ -1,34 +1,42 @@
 """
-services/checker.py — Production-grade Instagram username *registration-eligibility* checker.
+services/checker.py — Production-grade Instagram username availability checker.
 
-Uses Instagram's ``web_create_ajax/attempt/`` registration validation endpoint
-to determine whether a handle is truly open for new account creation — not merely
-whether a visible profile exists.  This eliminates false positives for
-banned, disabled, spam-blocked, or deleted accounts (e.g. ``uz.n``, ``ziynat``)
-that return HTTP 404 on profile views but **cannot** actually be registered.
+Uses direct profile page requests to ``https://www.instagram.com/{username}/``
+via ``curl_cffi`` with Chrome 124 TLS impersonation and a DataImpulse
+residential rotating proxy.  Fully cookie-free — no ``sessionid``,
+``csrftoken``, or any authentication tokens are sent.
 
 Strategy:
     1. **Tier 1** — offline syntax, length, and reserved-word pre-validation
        (instant, no network).
-    2. **Tier 2** — POST to Instagram's registration attempt endpoint via the
-       DataImpulse residential proxy with Chrome 124 TLS impersonation.
+    2. **Tier 2** — lightweight GET to the profile URL via the residential
+       proxy.  The HTTP status code deterministically resolves availability:
 
-    The registration endpoint evaluates the username against Instagram's full
-    internal ruleset (active accounts, disabled accounts, banned handles,
-    reserved words, spam filters, etc.) and returns an explicit JSON payload:
+       • HTTP 200 / 301 / 302  →  profile exists → **TAKEN**
+       • HTTP 404              →  profile absent  → **AVAILABLE**
+       • HTTP 429              →  rate-limited    → internal back-off,
+                                   session reset (cycles proxy IP), and
+                                   transparent retry — never surfaced to
+                                   the caller prematurely.
+       • HTTP 407              →  proxy auth fail → **ERROR**
+       • Network / timeout     →  transient fault → retry with back-off
 
-    • ``username_suggestions`` present  →  username is **unavailable** (TAKEN).
-    • No username error / suggestions    →  username is **available** for
-      registration right now.
-
-    A fresh ``csrftoken`` is obtained from the signup page on every session
-    initialisation — no hardcoded ``sessionid`` or ``csrftoken`` values are
-    stored, preventing IP-session mismatch or token expiry errors.
+    Rate-limit resilience:
+       HTTP 429 responses are absorbed *inside* ``_tier2_api_check`` via an
+       internal retry loop with exponential back-off (3 s → 6 s → 12 s,
+       capped at 30 s).  Each 429 triggers a full session reset that tears
+       down and rebuilds the ``AsyncSession``, causing the DataImpulse
+       rotating proxy to assign a fresh residential IP.  The outer
+       ``check_username`` retry loop handles non-429 transient errors
+       (network faults, 5xx, etc.) separately with its own back-off.
+       Together the two loops provide up to ~8 total attempts before an
+       ``ERROR`` is returned, virtually eliminating 429-induced failures.
 
 Integration:
-    - ``CheckResult`` dataclass and ``CheckStatus`` enum are the public interface.
-    - Module-level singleton ``instagram_checker`` is used by queue_manager.py,
-      handlers, and bot lifecycle hooks.
+    - ``CheckResult`` dataclass and ``CheckStatus`` enum are the public
+      interface consumed by ``queue_manager.py``, handlers, and formatters.
+    - Module-level singleton ``instagram_checker`` is used by ``bot.py``
+      lifecycle hooks (``start`` / ``stop``) and all call sites.
 """
 
 from __future__ import annotations
@@ -64,34 +72,31 @@ class CheckResult:
 
 # ─── Constants ──────────────────────────────────────────────────────────────────
 
-_SIGNUP_PAGE_URL = "https://www.instagram.com/accounts/emailsignup/"
-_ATTEMPT_URL = "https://www.instagram.com/accounts/web_create_ajax/attempt/"
+_PROFILE_URL_TEMPLATE = "https://www.instagram.com/{username}/"
 
-_COMMON_HEADERS = {
+# Browser-realistic headers — no auth cookies, no API-specific markers.
+_BROWSER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "*/*",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.instagram.com/accounts/emailsignup/",
-    "Origin": "https://www.instagram.com",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-    "X-Requested-With": "XMLHttpRequest",
-    "X-Instagram-AJAX": "1",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0",
 }
-
-# Dummy but valid-looking registration payload fields.
-# Instagram only validates the username field during the ``attempt`` step;
-# the rest are required to pass basic payload validation but are never
-# submitted to actually create an account.
-_DUMMY_EMAIL = "checkbot_placeholder_9182@proton.me"
-_DUMMY_FIRST_NAME = "Check"
-_DUMMY_PASSWORD = "Xk#9vLm2$qR8pZ!w"
 
 _RESERVED_USERNAMES: frozenset[str] = frozenset({
     "admin", "administrator", "instagram", "support", "help",
@@ -106,43 +111,45 @@ _RESERVED_USERNAMES: frozenset[str] = frozenset({
 #   • No consecutive periods
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9._]{1,30}$")
 
+# ── Internal 429-retry tunables ─────────────────────────────────────────────
+_RATE_LIMIT_MAX_INTERNAL_RETRIES = 4   # retries *within* a single _tier2 call
+_RATE_LIMIT_BASE_DELAY = 3.0           # seconds — first 429 back-off
+_RATE_LIMIT_MAX_DELAY = 30.0           # cap for exponential growth
+
 
 # ─── Core checker ───────────────────────────────────────────────────────────────
 
 class InstagramChecker:
     """
-    Deterministic Instagram username **registration-eligibility** checker.
+    Cookie-free Instagram username availability checker.
 
     Uses ``curl_cffi`` ``AsyncSession`` with Chrome 124 impersonation and the
-    DataImpulse residential proxy to POST to Instagram's registration attempt
-    endpoint.  No hardcoded session cookies are used — a fresh ``csrftoken``
-    is obtained from the signup page on every session initialisation.
+    DataImpulse residential rotating proxy to GET the public profile page.
+    No session cookies, CSRF tokens, or login credentials are sent.
 
-    Decision matrix (Tier 2 — registration attempt endpoint):
-    ──────────────────────────────────────────────────────────
-    Response contains ``username_suggestions`` or username
-    errors in ``errors.username``                       →  **TAKEN**
-    Response has ``status: "ok"`` with no username
-    errors and no ``username_suggestions``              →  **AVAILABLE**
-    HTTP 429                                            →  **ERROR** (rate-limited)
-    HTTP 407                                            →  **ERROR** (proxy auth)
-    Network / timeout / other                           →  **ERROR** (retried)
+    Decision matrix (Tier 2 — profile page request):
+    ─────────────────────────────────────────────────
+    HTTP 200 / 301 / 302  (profile exists)        →  **TAKEN**
+    HTTP 404              (profile absent)         →  **AVAILABLE**
+    HTTP 429              (rate-limited)           →  back-off + session
+                                                      reset → retry internally
+    HTTP 407              (proxy auth failure)     →  **ERROR**
+    HTTP 5xx / network    (transient)              →  **ERROR** (outer retry)
     """
 
     def __init__(
         self,
         proxy: Optional[str] = None,
-        timeout: float = 8.0,
+        timeout: float = 10.0,
     ) -> None:
         self._proxy = proxy
         self._timeout = timeout
         self._session: Optional[AsyncSession] = None
-        self._csrftoken: Optional[str] = None
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Initialise the HTTP session with proxy and obtain a fresh CSRF token."""
+        """Initialise the HTTP session with proxy (no cookies)."""
         if self._session is not None:
             return
 
@@ -154,88 +161,10 @@ class InstagramChecker:
             timeout=self._timeout,
         )
 
-        # Obtain a fresh csrftoken from the signup page.
-        await self._refresh_csrf_token()
-
         logger.info(
-            "InstagramChecker started (registration-eligibility mode) | proxy=%s | csrf=%s",
+            "InstagramChecker started (profile-check mode) | proxy=%s",
             proxy or "direct",
-            "obtained" if self._csrftoken else "MISSING",
         )
-
-    async def _refresh_csrf_token(self) -> None:
-        """
-        GET the Instagram signup page to extract a fresh ``csrftoken`` cookie.
-
-        The signup page always sets this cookie for unauthenticated visitors.
-        We use it in the ``X-CSRFToken`` header of subsequent POST requests.
-        """
-        if self._session is None:
-            return
-
-        try:
-            resp = await self._session.get(
-                _SIGNUP_PAGE_URL,
-                headers={
-                    "User-Agent": _COMMON_HEADERS["User-Agent"],
-                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-                timeout=self._timeout,
-            )
-
-            # Extract csrftoken from the session cookie jar.
-            csrf = None
-
-            # Method 1: dict-style access (most reliable for curl_cffi).
-            try:
-                csrf = self._session.cookies.get("csrftoken")
-            except Exception:
-                pass
-
-            # Method 2: iterate cookie jar objects.
-            if not csrf:
-                try:
-                    for cookie in self._session.cookies:
-                        if cookie.name == "csrftoken":
-                            csrf = cookie.value
-                            break
-                except Exception:
-                    pass
-
-            # Method 3: parse Set-Cookie header manually.
-            if not csrf:
-                set_cookie_headers = resp.headers.get("set-cookie", "")
-                if "csrftoken=" in set_cookie_headers:
-                    for part in set_cookie_headers.split("csrftoken="):
-                        if part:
-                            csrf = part.split(";")[0].strip()
-                            break
-
-            # Method 4: look for csrf_token in the HTML/JS response body.
-            if not csrf and resp.text:
-                body = resp.text
-                # Instagram embeds {"config":{"csrf_token":"..."}} in the page.
-                marker = '"csrf_token":"'
-                idx = body.find(marker)
-                if idx != -1:
-                    start = idx + len(marker)
-                    end = body.find('"', start)
-                    if end != -1:
-                        csrf = body[start:end]
-
-            self._csrftoken = csrf
-            if csrf:
-                logger.debug("CSRF token refreshed: %s…", csrf[:12])
-            else:
-                logger.warning(
-                    "Could not extract csrftoken from signup page (HTTP %d).",
-                    resp.status_code,
-                )
-
-        except Exception as exc:
-            logger.warning("Failed to refresh CSRF token: %s", exc)
-            self._csrftoken = None
 
     async def stop(self) -> None:
         """Alias for close — used by bot lifecycle hooks."""
@@ -249,10 +178,14 @@ class InstagramChecker:
             except Exception:
                 pass
             self._session = None
-            self._csrftoken = None
 
     async def _reset_session(self) -> None:
-        """Close the current session and re-initialise (cycles the proxy IP)."""
+        """
+        Close and re-create the session.
+
+        On a rotating residential proxy (DataImpulse) this forces a fresh
+        IP assignment, clearing any per-IP rate-limit state Instagram holds.
+        """
         await self.close()
         await self.start()
 
@@ -298,215 +231,162 @@ class InstagramChecker:
 
         return None  # OK — proceed to API check
 
-    # ── Tier 2: Registration attempt endpoint (cookie-free, proxy-backed) ───
+    # ── Tier 2: Profile page check (cookie-free, proxy-backed) ──────────────
 
     async def _tier2_api_check(self, username: str, start_time: float) -> CheckResult:
         """
-        POST to Instagram's ``web_create_ajax/attempt/`` endpoint to
-        determine whether *username* is truly available for registration.
+        GET ``https://www.instagram.com/{username}/`` via the residential
+        proxy and evaluate the HTTP status code.
 
-        This endpoint is the same one Instagram's web signup form uses to
-        validate fields in real-time.  It returns a JSON payload indicating:
+        HTTP 429 is handled *internally* with an exponential back-off loop
+        and session reset (to cycle the proxy IP).  The caller never sees a
+        429 unless all internal retries are exhausted.
 
-        • ``errors.username`` present or ``username_suggestions`` present
-          →  The handle is taken, reserved, banned, or otherwise unavailable.
-        • No username error and ``status == "ok"``
-          →  The handle is genuinely free for new registration.
-
-        No account is created — the ``/attempt/`` step only validates.
+        Returns
+        -------
+        CheckResult
+            TAKEN, AVAILABLE, or ERROR (for truly unrecoverable faults).
         """
-        session = await self._get_session()
+        url = _PROFILE_URL_TEMPLATE.format(username=username)
 
-        # Ensure we have a CSRF token.
-        if not self._csrftoken:
-            await self._refresh_csrf_token()
-            if not self._csrftoken:
+        # ── Internal 429-absorption loop ────────────────────────────────
+        for rate_attempt in range(_RATE_LIMIT_MAX_INTERNAL_RETRIES + 1):
+            session = await self._get_session()
+
+            try:
+                resp = await session.get(
+                    url,
+                    headers=_BROWSER_HEADERS,
+                    timeout=self._timeout,
+                    allow_redirects=False,
+                )
+            except Exception as exc:
+                logger.warning("Network error checking @%s: %s", username, exc)
                 return CheckResult(
                     username=username,
                     status=CheckStatus.ERROR,
-                    reason="csrf_unavailable",
-                    error_message="Could not obtain CSRF token from Instagram signup page",
+                    reason="network_error",
+                    error_message=f"{type(exc).__name__}: {exc}",
                     response_time=round(time.perf_counter() - start_time, 3),
                 )
 
-        headers = {
-            **_COMMON_HEADERS,
-            "X-CSRFToken": self._csrftoken,
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
+            status = resp.status_code
+            elapsed = round(time.perf_counter() - start_time, 3)
 
-        payload = {
-            "email": _DUMMY_EMAIL,
-            "username": username,
-            "first_name": _DUMMY_FIRST_NAME,
-            "password": _DUMMY_PASSWORD,
-            "opt_into_one_tap": "false",
-        }
+            # ── HTTP 404: profile does not exist → AVAILABLE ────────────
+            if status == 404:
+                return CheckResult(
+                    username=username,
+                    status=CheckStatus.AVAILABLE,
+                    reason="not_found",
+                    http_status=404,
+                    response_time=elapsed,
+                )
 
-        try:
-            resp = await session.post(
-                _ATTEMPT_URL,
-                headers=headers,
-                data=payload,
-                timeout=self._timeout,
-            )
-        except Exception as exc:
-            logger.warning("Network error checking @%s: %s", username, exc)
-            return CheckResult(
-                username=username,
-                status=CheckStatus.ERROR,
-                reason="network_error",
-                error_message=f"{type(exc).__name__}: {exc}",
-                response_time=round(time.perf_counter() - start_time, 3),
-            )
+            # ── HTTP 200 / 301 / 302: profile exists → TAKEN ───────────
+            if status in (200, 301, 302):
+                return CheckResult(
+                    username=username,
+                    status=CheckStatus.TAKEN,
+                    reason="profile_exists",
+                    http_status=status,
+                    response_time=elapsed,
+                )
 
-        elapsed = round(time.perf_counter() - start_time, 3)
+            # ── HTTP 429: rate-limited → back-off + cycle proxy IP ──────
+            if status == 429:
+                if rate_attempt < _RATE_LIMIT_MAX_INTERNAL_RETRIES:
+                    delay = min(
+                        _RATE_LIMIT_BASE_DELAY * (2 ** rate_attempt),
+                        _RATE_LIMIT_MAX_DELAY,
+                    )
+                    logger.warning(
+                        "HTTP 429 for @%s — internal retry %d/%d, "
+                        "resetting session and sleeping %.1fs to cycle proxy IP",
+                        username,
+                        rate_attempt + 1,
+                        _RATE_LIMIT_MAX_INTERNAL_RETRIES,
+                        delay,
+                    )
+                    await self._reset_session()
+                    await asyncio.sleep(delay)
+                    continue  # retry with fresh session / IP
 
-        # ── HTTP 429: rate-limited → ERROR (retriable) ──────────────────
-        if resp.status_code == 429:
-            return CheckResult(
-                username=username,
-                status=CheckStatus.ERROR,
-                reason="rate_limited",
-                error_message="HTTP 429 — rate limited by Instagram",
-                http_status=429,
-                response_time=elapsed,
-            )
+                # All internal retries exhausted — surface as ERROR.
+                logger.error(
+                    "HTTP 429 for @%s — all %d internal retries exhausted",
+                    username, _RATE_LIMIT_MAX_INTERNAL_RETRIES,
+                )
+                return CheckResult(
+                    username=username,
+                    status=CheckStatus.ERROR,
+                    reason="rate_limited",
+                    error_message=(
+                        f"HTTP 429 — rate limited after "
+                        f"{_RATE_LIMIT_MAX_INTERNAL_RETRIES} internal retries"
+                    ),
+                    http_status=429,
+                    response_time=elapsed,
+                )
 
-        # ── HTTP 407: proxy authentication required ─────────────────────
-        if resp.status_code == 407:
-            return CheckResult(
-                username=username,
-                status=CheckStatus.ERROR,
-                reason="proxy_auth_failed",
-                error_message="HTTP 407 — proxy authentication failed (check PROXY_URL credentials)",
-                http_status=407,
-                response_time=elapsed,
-            )
+            # ── HTTP 407: proxy authentication required ─────────────────
+            if status == 407:
+                return CheckResult(
+                    username=username,
+                    status=CheckStatus.ERROR,
+                    reason="proxy_auth_failed",
+                    error_message=(
+                        "HTTP 407 — proxy authentication failed "
+                        "(check PROXY_URL credentials)"
+                    ),
+                    http_status=407,
+                    response_time=elapsed,
+                )
 
-        # ── HTTP 403 / 401: blocked or CSRF invalid → ERROR (retriable) ─
-        if resp.status_code in (401, 403):
+            # ── HTTP 401 / 403: Instagram blocked the request ───────────
+            if status in (401, 403):
+                return CheckResult(
+                    username=username,
+                    status=CheckStatus.ERROR,
+                    reason="blocked",
+                    error_message=f"HTTP {status} — request blocked by Instagram",
+                    http_status=status,
+                    response_time=elapsed,
+                )
+
+            # ── HTTP 5xx: server error → ERROR (retriable by outer loop) ─
+            if status >= 500:
+                return CheckResult(
+                    username=username,
+                    status=CheckStatus.ERROR,
+                    reason="server_error",
+                    error_message=f"HTTP {status} — Instagram server error",
+                    http_status=status,
+                    response_time=elapsed,
+                )
+
+            # ── Any other unexpected status → ERROR ─────────────────────
             logger.warning(
-                "HTTP %d for @%s — CSRF token may be stale, will reset session.",
-                resp.status_code, username,
+                "Unexpected HTTP %d for @%s", status, username,
             )
-            return CheckResult(
-                username=username,
-                status=CheckStatus.ERROR,
-                reason="auth_blocked",
-                error_message=f"HTTP {resp.status_code} — session/CSRF rejected, will retry with fresh token",
-                http_status=resp.status_code,
-                response_time=elapsed,
-            )
-
-        # ── HTTP 5xx: server error → ERROR (retriable) ─────────────────
-        if resp.status_code >= 500:
-            return CheckResult(
-                username=username,
-                status=CheckStatus.ERROR,
-                reason="server_error",
-                error_message=f"HTTP {resp.status_code} — Instagram server error",
-                http_status=resp.status_code,
-                response_time=elapsed,
-            )
-
-        # ── Other non-200 status codes → ERROR ─────────────────────────
-        if resp.status_code != 200:
             return CheckResult(
                 username=username,
                 status=CheckStatus.ERROR,
                 reason="http_error",
-                error_message=f"HTTP {resp.status_code}",
-                http_status=resp.status_code,
+                error_message=f"HTTP {status} — unexpected status code",
+                http_status=status,
                 response_time=elapsed,
             )
 
-        # ── HTTP 200: parse JSON response ───────────────────────────────
-        try:
-            data: dict[str, Any] = resp.json()
-        except Exception:
-            return CheckResult(
-                username=username,
-                status=CheckStatus.ERROR,
-                reason="invalid_json",
-                error_message="HTTP 200 but response body is not valid JSON",
-                http_status=200,
-                response_time=elapsed,
-            )
-
-        # ── Evaluate the registration response payload ──────────────────
-        #
-        # The ``/attempt/`` endpoint returns JSON like:
-        #
-        #   Taken / banned / reserved:
-        #     {"errors": {"username": [{"message": "...", "code": "..."}]},
-        #      "username_suggestions": ["alt1", "alt2", ...],
-        #      "status": "ok"}
-        #
-        #   Available (all fields passed validation):
-        #     {"errors": {},  "status": "ok",  "dryrun_passed": true}
-        #     or simply no "username" key in "errors" and no "username_suggestions".
-        #
-        # We check for ANY sign that the username was rejected.
-
-        errors = data.get("errors", {})
-        username_errors = errors.get("username") if isinstance(errors, dict) else None
-        has_suggestions = bool(data.get("username_suggestions"))
-
-        # TAKEN: username errors present or suggestions offered.
-        if username_errors or has_suggestions:
-            # Extract the human-readable reason if available.
-            reject_reason = "username_is_taken"
-            if isinstance(username_errors, list) and username_errors:
-                first_error = username_errors[0]
-                if isinstance(first_error, dict):
-                    reject_reason = first_error.get("code", "username_is_taken")
-                elif isinstance(first_error, str):
-                    reject_reason = first_error
-
-            return CheckResult(
-                username=username,
-                status=CheckStatus.TAKEN,
-                reason=reject_reason,
-                http_status=200,
-                response_time=elapsed,
-            )
-
-        # AVAILABLE: status is "ok" and no username rejection signals.
-        status_field = data.get("status", "")
-        if status_field == "ok":
-            # Double-check: if "dryrun_passed" is explicitly False, treat
-            # as taken (safety net for undocumented edge cases).
-            if data.get("dryrun_passed") is False:
-                return CheckResult(
-                    username=username,
-                    status=CheckStatus.TAKEN,
-                    reason="dryrun_failed",
-                    http_status=200,
-                    response_time=elapsed,
-                )
-
-            return CheckResult(
-                username=username,
-                status=CheckStatus.AVAILABLE,
-                reason="truly_available",
-                http_status=200,
-                response_time=elapsed,
-            )
-
-        # Edge case: unexpected response shape — treat as ERROR to be safe,
-        # rather than producing a false positive.
-        logger.warning(
-            "Unexpected registration response for @%s: %s",
-            username, data,
-        )
+        # Defensive — should never be reached due to the explicit return
+        # inside the 429 exhaustion branch above.
         return CheckResult(
             username=username,
             status=CheckStatus.ERROR,
-            reason="unexpected_response",
-            error_message=f"Unexpected JSON payload (status={status_field!r})",
-            http_status=200,
-            response_time=elapsed,
+            reason="rate_limited",
+            error_message="HTTP 429 — internal retries exhausted (fallback)",
+            http_status=429,
+            response_time=round(time.perf_counter() - start_time, 3),
         )
 
     # ── Public interface ────────────────────────────────────────────────────
@@ -518,16 +398,19 @@ class InstagramChecker:
         **kwargs: Any,
     ) -> CheckResult:
         """
-        Check a single Instagram username for registration availability.
+        Check a single Instagram username for availability.
 
         Pipeline:
             1. Tier 1 — syntax / reserved pre-validation (instant, no network).
-            2. Tier 2 — registration attempt endpoint via residential proxy.
+            2. Tier 2 — profile page check via residential proxy, with
+               internal 429-absorption and outer retry for other transient
+               errors.
 
-        Retries on transient errors (network failures, HTTP 429, 5xx, 401/403)
-        up to *max_retries* times with exponential back-off.  Session is reset
-        on rate-limits and auth errors to cycle the proxy IP and refresh the
-        CSRF token.
+        The inner ``_tier2_api_check`` absorbs HTTP 429 with up to
+        ``_RATE_LIMIT_MAX_INTERNAL_RETRIES`` back-off cycles.  This outer
+        loop retries on non-429 transient errors (network faults, HTTP 5xx,
+        blocks) up to *max_retries* times with exponential back-off and
+        session reset.
         """
         start_time = time.perf_counter()
         clean = username.strip().lower()
@@ -537,7 +420,7 @@ class InstagramChecker:
         if precheck is not None:
             return precheck
 
-        # ── Tier 2: registration attempt check (with retries) ───────────
+        # ── Tier 2: profile check (with outer retries) ──────────────────
         last_result: Optional[CheckResult] = None
 
         for attempt in range(max_retries + 1):
@@ -550,21 +433,13 @@ class InstagramChecker:
             # Transient error — retry after exponential back-off.
             last_result = result
             if attempt < max_retries:
-                backoff = min(2.0 * (2 ** attempt), 30.0)  # 2s, 4s, 8s … cap 30s
+                backoff = min(2.0 * (2 ** attempt), 20.0)  # 2s, 4s, 8s … cap 20s
                 logger.info(
-                    "Retry %d/%d for @%s (reason=%s), sleeping %.1fs",
+                    "Outer retry %d/%d for @%s (reason=%s), sleeping %.1fs",
                     attempt + 1, max_retries, clean, result.reason, backoff,
                 )
-                # Reset session on rate-limit, auth errors, or CSRF failure
-                # to cycle the proxy IP and obtain a fresh CSRF token.
-                if result.reason in (
-                    "rate_limited",
-                    "auth_blocked",
-                    "csrf_unavailable",
-                    "proxy_auth_failed",
-                ):
-                    await self._reset_session()
-
+                # Reset session to cycle proxy IP on any transient error.
+                await self._reset_session()
                 await asyncio.sleep(backoff)
 
         # All retries exhausted — return last error.
