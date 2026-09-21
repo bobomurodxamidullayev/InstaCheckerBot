@@ -28,9 +28,9 @@ logger = logging.getLogger(__name__)
 
 # ─── Authenticated session credentials ─────────────────────────────────────────
 INSTA_SESSION_ID = (
-    "23761489380%3AKb1sdzj29KjSCF%3A3%3AAYhau5evQnEkTxUMgaO4OuZnXf6WJVv_dYHYbwCJKw"
+    "23761489380%3AAbLR636kJvXaKq5%3A3%3AAY%2FPPsZZwt4zx-ifoy0gpcz1YlBv9XgE-Xad89Nidw"
 )
-INSTA_CSRF_TOKEN = "JUL4o1baRX59czy51wZIVO1cTzvFkRSs"
+INSTA_CSRF_TOKEN = "Y3BiL7beiPWOobdojgeeclq6Or1ed6d4"
 
 
 # ─── Public data structures ────────────────────────────────────────────────────
