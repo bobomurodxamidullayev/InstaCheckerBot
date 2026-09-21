@@ -1,20 +1,27 @@
 """
 services/checker.py — Cookie-free Instagram username availability checker.
 
-Uses curl_cffi with Chrome 124 browser impersonation and Instagram's public
-oEmbed API (no authentication required) to deterministically resolve whether
-a handle is TAKEN or AVAILABLE.
+Uses curl_cffi with Chrome 124 browser impersonation to request the public
+profile page at ``https://www.instagram.com/{username}/``.  Instagram serves
+a full 200 response for any existing handle (public or private) and a clean
+404 for non-existent profiles — no cookies, CSRF tokens, or login credentials
+required.
 
-Why oEmbed?
-    Instagram's /api/v1/oembed/ endpoint is a stable, public, unauthenticated
-    API that returns profile metadata for existing accounts (HTTP 200) and a
-    clean 404 for non-existent profiles.  It requires no session cookies,
-    CSRF tokens, or login credentials — making it immune to the 401 errors
-    caused by invalidated cookies on data-center IPs.
+Strategy:
+    The direct profile URL is the most stable unauthenticated surface on
+    Instagram.  Unlike internal API routes (web_profile_info, oEmbed,
+    check_username) that enforce strict auth/cookie/query-param validation,
+    the public profile page is designed for browsers and search-engine
+    crawlers.  With curl_cffi browser impersonation the TLS fingerprint
+    matches a real Chrome 124 session, avoiding bot-detection triggers.
+
+    Redirects are intercepted (``allow_redirects=False``) to detect
+    rate-limiting / challenge redirects that would otherwise silently land
+    on a login page and produce a false positive.
 
 Integration:
     - CheckResult dataclass and CheckStatus enum are the public interface.
-    - Module-level singleton `instagram_checker` is used by queue_manager.py
+    - Module-level singleton ``instagram_checker`` is used by queue_manager.py
       and handlers.
 """
 
@@ -50,9 +57,7 @@ class CheckResult:
 
 # ─── Constants ──────────────────────────────────────────────────────────────────
 
-_OEMBED_URL_TEMPLATE = (
-    "https://www.instagram.com/api/v1/oembed/?url=https://www.instagram.com/{}/"
-)
+_PROFILE_URL_TEMPLATE = "https://www.instagram.com/{}/"
 
 _HEADERS = {
     "User-Agent": (
@@ -60,10 +65,18 @@ _HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/plain, */*",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;"
+        "q=0.9,image/avif,image/webp,*/*;q=0.8"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.instagram.com/",
-    "Origin": "https://www.instagram.com",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0",
 }
 
 _RESERVED_USERNAMES: frozenset[str] = frozenset({
@@ -79,6 +92,16 @@ _RESERVED_USERNAMES: frozenset[str] = frozenset({
 #   • No consecutive periods
 _USERNAME_RE = re.compile(r"^[a-zA-Z0-9._]{1,30}$")
 
+# Lightweight patterns to confirm a real profile page was served (not a
+# generic error shell or login interstitial).  We only need ONE match.
+_PROFILE_SIGNALS = (
+    '"@',                       # og:description contains "@username"
+    '"profilePage_',            # internal React component identifier
+    '"profile_pic_url"',        # JSON-LD / shared-data field
+    'property="og:title"',      # Open Graph title tag
+    '"UserProfilePage"',        # page type identifier in shared data
+)
+
 
 # ─── Core checker ───────────────────────────────────────────────────────────────
 
@@ -87,10 +110,11 @@ class InstagramChecker:
     Deterministic, cookie-free Instagram username availability checker.
 
     Uses curl_cffi AsyncSession with Chrome 124 impersonation and the
-    public oEmbed API — no session cookies or login credentials required.
+    direct public profile page — no session cookies or login credentials.
 
-    * HTTP 200 + valid author metadata  →  **TAKEN**
+    * HTTP 200 + profile page content   →  **TAKEN**
     * HTTP 404                          →  **AVAILABLE**
+    * HTTP 301/302 to login/challenge   →  **ERROR** (blocked / rate-limited)
     * Anything else                     →  **ERROR** (retried)
     """
 
@@ -170,29 +194,36 @@ class InstagramChecker:
 
         return None  # OK — proceed to API check
 
-    # ── Tier 2: Public oEmbed check (cookie-free) ───────────────────────────
+    # ── Tier 2: Public profile page check (cookie-free) ─────────────────────
 
     async def _tier2_api_check(self, username: str, start_time: float) -> CheckResult:
         """
-        GET Instagram's public ``oEmbed`` endpoint to deterministically
-        resolve whether *username* exists — no cookies or auth required.
+        GET the public Instagram profile page to deterministically resolve
+        whether *username* exists — no cookies or auth required.
+
+        Redirects are intercepted (``allow_redirects=False``) so that
+        rate-limit / challenge redirects to ``/accounts/login/`` or
+        ``/challenge/`` are caught and surfaced as retriable errors
+        instead of producing false positives.
 
         Decision matrix
         ───────────────
-        HTTP 200 + author_name/author_id present  →  TAKEN
-        HTTP 404 (profile does not exist)          →  AVAILABLE
-        HTTP 429                                   →  ERROR (rate_limited)
-        Other / network fault                      →  ERROR (retriable)
+        HTTP 200 + profile content confirmed  →  TAKEN
+        HTTP 404                              →  AVAILABLE
+        HTTP 301/302 to /accounts/login/      →  ERROR (blocked)
+        HTTP 301/302 to /challenge/           →  ERROR (challenge)
+        HTTP 429                              →  ERROR (rate_limited)
+        Other / network fault                 →  ERROR (retriable)
         """
         session = await self._get_session()
-
-        url = _OEMBED_URL_TEMPLATE.format(username)
+        url = _PROFILE_URL_TEMPLATE.format(username)
 
         try:
             resp = await session.get(
                 url,
                 headers=_HEADERS,
                 timeout=self._timeout,
+                allow_redirects=False,
             )
         except Exception as exc:
             logger.warning("Network error checking @%s: %s", username, exc)
@@ -216,6 +247,67 @@ class InstagramChecker:
                 response_time=elapsed,
             )
 
+        # ── HTTP 301/302/303/307/308: redirect → inspect Location ───────
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("location", "").lower()
+
+            if "/accounts/login" in location or "/accounts/signup" in location:
+                return CheckResult(
+                    username=username,
+                    status=CheckStatus.ERROR,
+                    reason="login_redirect",
+                    error_message=(
+                        f"HTTP {resp.status_code} redirect to login — "
+                        "possible rate-limit or IP block"
+                    ),
+                    http_status=resp.status_code,
+                    response_time=elapsed,
+                )
+
+            if "/challenge/" in location:
+                return CheckResult(
+                    username=username,
+                    status=CheckStatus.ERROR,
+                    reason="challenge_redirect",
+                    error_message=(
+                        f"HTTP {resp.status_code} redirect to challenge — "
+                        "Instagram is requesting verification"
+                    ),
+                    http_status=resp.status_code,
+                    response_time=elapsed,
+                )
+
+            # Any other redirect (e.g. trailing-slash normalisation) — follow
+            # it manually once and treat the final status as the real answer.
+            # This covers the rare ``/Username`` → ``/username/`` redirect.
+            try:
+                resp = await session.get(
+                    location if location.startswith("http") else f"https://www.instagram.com{location}",
+                    headers=_HEADERS,
+                    timeout=self._timeout,
+                    allow_redirects=False,
+                )
+            except Exception as exc:
+                logger.warning("Redirect follow error for @%s: %s", username, exc)
+                return CheckResult(
+                    username=username,
+                    status=CheckStatus.ERROR,
+                    reason="network_error",
+                    error_message=f"Redirect follow failed: {type(exc).__name__}: {exc}",
+                    response_time=round(time.perf_counter() - start_time, 3),
+                )
+            elapsed = round(time.perf_counter() - start_time, 3)
+
+            # Re-evaluate the followed response (404 / 200 / error).
+            if resp.status_code == 404:
+                return CheckResult(
+                    username=username,
+                    status=CheckStatus.AVAILABLE,
+                    reason="truly_available",
+                    http_status=404,
+                    response_time=elapsed,
+                )
+
         # ── HTTP 429: rate-limited → ERROR (retriable) ──────────────────
         if resp.status_code == 429:
             return CheckResult(
@@ -238,24 +330,18 @@ class InstagramChecker:
                 response_time=elapsed,
             )
 
-        # ── HTTP 200: parse JSON and verify author metadata ─────────────
+        # ── HTTP 200: verify the body is a real profile page ────────────
+        #
+        # Instagram always returns a 200 HTML shell — even for error pages
+        # served via client-side rendering.  We do a lightweight scan for
+        # profile-specific markers to confirm the handle truly exists.
         try:
-            data: dict[str, Any] = resp.json()
+            body = resp.text
         except Exception:
-            return CheckResult(
-                username=username,
-                status=CheckStatus.ERROR,
-                reason="invalid_json",
-                error_message="Response body is not valid JSON",
-                http_status=200,
-                response_time=elapsed,
-            )
+            body = ""
 
-        # oEmbed returns {"author_name": "...", "author_id": ..., ...}
-        # for existing profiles.  Verify at least one identifying field.
-        has_author = bool(data.get("author_name") or data.get("author_id"))
-
-        if has_author:
+        # Check for any profile-specific signal in the HTML.
+        if any(signal in body for signal in _PROFILE_SIGNALS):
             return CheckResult(
                 username=username,
                 status=CheckStatus.TAKEN,
@@ -264,12 +350,35 @@ class InstagramChecker:
                 response_time=elapsed,
             )
 
-        # 200 but no author metadata — treat as available (edge case for
-        # deactivated / empty profiles that still return a stub response).
+        # If the page contains a clear "not found" indicator served inside
+        # a 200 shell (Instagram's SPA sometimes does this), mark available.
+        not_found_indicators = (
+            '"HttpErrorPage"',
+            "Sorry, this page isn",       # "Sorry, this page isn't available."
+            '"error_page"',
+        )
+        if any(indicator in body for indicator in not_found_indicators):
+            return CheckResult(
+                username=username,
+                status=CheckStatus.AVAILABLE,
+                reason="truly_available",
+                http_status=200,
+                response_time=elapsed,
+            )
+
+        # 200 but no recognizable markers — could be a JS-only shell or
+        # a CAPTCHA interstitial.  Surface as a retriable error rather
+        # than guessing wrong.
+        body_preview = body[:300].replace("\n", " ").strip() if body else "(empty)"
+        logger.warning(
+            "Unrecognized 200 body for @%s (len=%d): %s",
+            username, len(body), body_preview,
+        )
         return CheckResult(
             username=username,
-            status=CheckStatus.AVAILABLE,
-            reason="truly_available",
+            status=CheckStatus.ERROR,
+            reason="unrecognized_response",
+            error_message="HTTP 200 but no profile markers found — possible CAPTCHA or JS shell",
             http_status=200,
             response_time=elapsed,
         )
@@ -287,10 +396,10 @@ class InstagramChecker:
 
         Pipeline:
             1. Tier 1 — syntax / reserved pre-validation (instant, no network).
-            2. Tier 2 — public oEmbed API check (cookie-free).
+            2. Tier 2 — public profile page check (cookie-free).
 
-        Retries on transient errors (network failures, HTTP 429) up to
-        *max_retries* times with incremental back-off.
+        Retries on transient errors (network failures, HTTP 429, redirects)
+        up to *max_retries* times with incremental back-off.
         """
         start_time = time.perf_counter()
         clean = username.strip().lower()
@@ -300,7 +409,7 @@ class InstagramChecker:
         if precheck is not None:
             return precheck
 
-        # ── Tier 2: oEmbed API check (with retries) ─────────────────────
+        # ── Tier 2: profile page check (with retries) ───────────────────
         last_result: Optional[CheckResult] = None
 
         for attempt in range(max_retries + 1):
@@ -318,8 +427,9 @@ class InstagramChecker:
                     "Retry %d/%d for @%s (reason=%s), sleeping %.1fs",
                     attempt + 1, max_retries, clean, result.reason, backoff,
                 )
-                # Reset session on rate-limit to cycle connection.
-                if result.reason == "rate_limited":
+                # Reset session on rate-limit or redirect blocks to cycle
+                # the TCP connection and clear any server-side affinity.
+                if result.reason in ("rate_limited", "login_redirect", "challenge_redirect"):
                     await self.close()
                 await asyncio.sleep(backoff)
 
