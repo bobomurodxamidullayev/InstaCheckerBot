@@ -1,10 +1,10 @@
 """
 services/checker.py — Authenticated Instagram username availability checker.
 
-Uses curl_cffi with browser impersonation and live session credentials
-to query Instagram's check_username API endpoint. This eliminates
-false-positive AVAILABLE responses that occur with unauthenticated
-(guest) requests.
+Uses curl_cffi with Chrome 124 browser impersonation and live session
+credentials to query Instagram's web_profile_info endpoint.  A real
+profile response means the handle is TAKEN; a 404 / null-user response
+means the handle is AVAILABLE.
 
 Integration:
     - CheckResult dataclass and CheckStatus enum are the public interface.
@@ -14,6 +14,7 @@ Integration:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -28,9 +29,9 @@ logger = logging.getLogger(__name__)
 
 # ─── Authenticated session credentials ─────────────────────────────────────────
 INSTA_SESSION_ID = (
-    "23761489380%3AAbLR636kJvXaKq5%3A3%3AAY%2FPPsZZwt4zx-ifoy0gpcz1YlBv9XgE-Xad89Nidw"
+    "40137255195%3AdYjlsW9FTWJ9MD%3A19%3A3AAYkrmRfVGsglXHzdexZG6BF4FPHdkYlRnApGfH8Fg"
 )
-INSTA_CSRF_TOKEN = "Y3BiL7beiPWOobdojgeeclq6Or1ed6d4"
+INSTA_CSRF_TOKEN = "cUHu0IfNR8e9jfzUlfOreEaXcTldRvp8"
 
 
 # ─── Public data structures ────────────────────────────────────────────────────
@@ -49,23 +50,9 @@ class CheckResult:
 
 # ─── Constants ──────────────────────────────────────────────────────────────────
 
-_CHECK_USERNAME_URL = "https://www.instagram.com/api/v1/web/accounts/check_username/"
-
-_BROWSER_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "X-CSRFToken": INSTA_CSRF_TOKEN,
-    "X-IG-App-ID": "936619743392459",
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": "https://www.instagram.com/accounts/emailsignup/",
-    "Origin": "https://www.instagram.com",
-    "Content-Type": "application/x-www-form-urlencoded",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-}
+_PROFILE_URL_TEMPLATE = (
+    "https://www.instagram.com/api/v1/users/web_profile_info/?username={}"
+)
 
 _RESERVED_USERNAMES: frozenset[str] = frozenset({
     "admin", "administrator", "instagram", "support", "help",
@@ -74,7 +61,7 @@ _RESERVED_USERNAMES: frozenset[str] = frozenset({
 })
 
 # Instagram username rules:
-#   • 1-30 characters
+#   • 1–30 characters
 #   • Only letters (a-z), digits (0-9), periods (.) and underscores (_)
 #   • Cannot start or end with a period
 #   • No consecutive periods
@@ -89,8 +76,11 @@ class InstagramChecker:
 
     Uses curl_cffi AsyncSession with Chrome 124 impersonation and injected
     session cookies so that every request is treated as a logged-in browser
-    interaction, bypassing anonymous rate limits and eliminating false-positive
-    "available" responses for taken/banned handles.
+    interaction.  Queries the ``web_profile_info`` endpoint:
+
+    * HTTP 200 + valid user object  →  **TAKEN**
+    * HTTP 404 / user is ``None``   →  **AVAILABLE**
+    * Anything else                 →  **ERROR** (retried)
     """
 
     def __init__(
@@ -178,20 +168,41 @@ class InstagramChecker:
 
         return None  # OK — proceed to API check
 
-    # ── Tier 2: Authenticated API check ─────────────────────────────────────
+    # ── Tier 2: Authenticated web_profile_info check ────────────────────────
 
     async def _tier2_api_check(self, username: str, start_time: float) -> CheckResult:
         """
-        POST to Instagram's check_username endpoint as an authenticated
-        session to get a deterministic available/taken answer.
+        GET Instagram's ``web_profile_info`` endpoint as an authenticated
+        session to deterministically resolve whether *username* exists.
+
+        Decision matrix
+        ───────────────
+        HTTP 200 + user object present  →  TAKEN
+        HTTP 404 / user object is None  →  AVAILABLE
+        HTTP 429                        →  ERROR (rate_limited, retriable)
+        Other / network fault           →  ERROR (retriable)
         """
         session = await self._get_session()
 
+        url = _PROFILE_URL_TEMPLATE.format(username)
+
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "X-IG-App-ID": "936619743392459",
+            "X-CSRFToken": INSTA_CSRF_TOKEN,
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": f"https://www.instagram.com/{username}/",
+            "Accept": "*/*",
+        }
+
         try:
-            resp = await session.post(
-                _CHECK_USERNAME_URL,
-                headers=_BROWSER_HEADERS,
-                data={"username": username},
+            resp = await session.get(
+                url,
+                headers=headers,
                 timeout=self._timeout,
             )
         except Exception as exc:
@@ -206,19 +217,39 @@ class InstagramChecker:
 
         elapsed = round(time.perf_counter() - start_time, 3)
 
-        # ── Non-200 responses ───────────────────────────────────────────
-        if resp.status_code != 200:
-            reason = "rate_limited" if resp.status_code == 429 else "http_error"
+        # ── HTTP 404: profile does not exist → AVAILABLE ────────────────
+        if resp.status_code == 404:
+            return CheckResult(
+                username=username,
+                status=CheckStatus.AVAILABLE,
+                reason="truly_available",
+                http_status=404,
+                response_time=elapsed,
+            )
+
+        # ── HTTP 429: rate-limited → ERROR (retriable) ──────────────────
+        if resp.status_code == 429:
             return CheckResult(
                 username=username,
                 status=CheckStatus.ERROR,
-                reason=reason,
+                reason="rate_limited",
+                error_message="HTTP 429 — rate limited",
+                http_status=429,
+                response_time=elapsed,
+            )
+
+        # ── Other non-200 status codes → ERROR ─────────────────────────
+        if resp.status_code != 200:
+            return CheckResult(
+                username=username,
+                status=CheckStatus.ERROR,
+                reason="http_error",
                 error_message=f"HTTP {resp.status_code}",
                 http_status=resp.status_code,
                 response_time=elapsed,
             )
 
-        # ── Parse JSON body ─────────────────────────────────────────────
+        # ── HTTP 200: parse JSON and inspect user object ────────────────
         try:
             data: dict[str, Any] = resp.json()
         except Exception:
@@ -231,23 +262,10 @@ class InstagramChecker:
                 response_time=elapsed,
             )
 
-        # ── Decision logic (strict) ─────────────────────────────────────
-        #
-        # TAKEN when:
-        #   • data["available"] is explicitly False
-        #   • response contains an "errors" key (username errors, bans, etc.)
-        #   • data["status"] == "fail"
-        #
-        # AVAILABLE when:
-        #   • data["available"] is explicitly True
-        #
-        # Anything else → ERROR (unexpected payload shape).
+        user_obj = data.get("data", {}).get("user")
 
-        if (
-            data.get("available") is False
-            or "errors" in data
-            or data.get("status") == "fail"
-        ):
+        if user_obj is not None:
+            # Profile exists — handle is taken.
             return CheckResult(
                 username=username,
                 status=CheckStatus.TAKEN,
@@ -256,26 +274,11 @@ class InstagramChecker:
                 response_time=elapsed,
             )
 
-        if data.get("available") is True:
-            return CheckResult(
-                username=username,
-                status=CheckStatus.AVAILABLE,
-                reason="truly_available",
-                http_status=200,
-                response_time=elapsed,
-            )
-
-        # Unexpected response shape — surface for debugging.
-        logger.error(
-            "Unexpected API response for @%s: %s",
-            username,
-            str(data)[:300],
-        )
+        # User object is None / missing — handle is available.
         return CheckResult(
             username=username,
-            status=CheckStatus.ERROR,
-            reason="unexpected_response",
-            error_message=f"Unrecognised payload: {str(data)[:200]}",
+            status=CheckStatus.AVAILABLE,
+            reason="truly_available",
             http_status=200,
             response_time=elapsed,
         )
@@ -293,7 +296,7 @@ class InstagramChecker:
 
         Pipeline:
             1. Tier 1 — syntax / reserved pre-validation (instant, no network).
-            2. Tier 2 — authenticated POST to check_username API.
+            2. Tier 2 — authenticated GET to web_profile_info API.
 
         Retries on transient errors (network failures, HTTP 429) up to
         *max_retries* times with incremental back-off.
@@ -319,14 +322,12 @@ class InstagramChecker:
             # Transient error — retry after back-off.
             last_result = result
             if attempt < max_retries:
-                import asyncio
-
                 backoff = 1.5 * (attempt + 1)
                 logger.info(
                     "Retry %d/%d for @%s (reason=%s), sleeping %.1fs",
                     attempt + 1, max_retries, clean, result.reason, backoff,
                 )
-                # Reset session on rate-limit to cycle cookies/connection.
+                # Reset session on rate-limit to cycle cookies / connection.
                 if result.reason == "rate_limited":
                     await self.close()
                 await asyncio.sleep(backoff)
