@@ -1,22 +1,24 @@
 """
-services/checker.py — Authenticated Instagram username availability checker.
+services/checker.py — Cookie-free Instagram username availability checker.
 
-Uses curl_cffi with Chrome 124 browser impersonation, a valid Instagram
-session cookie, and the configured DataImpulse residential proxy to query
-Instagram's ``web_profile_info`` JSON endpoint.
+Uses curl_cffi with Chrome 124 browser impersonation and the configured
+DataImpulse residential proxy to query Instagram's public oEmbed endpoint.
+No session cookies or login credentials required.
 
 Strategy:
-    Instagram's login wall blocks unauthenticated requests from any IP
-    (residential or data-center) with a 302 redirect to /accounts/login/.
-    To bypass this, we inject a valid ``sessionid`` cookie and route every
-    request through the DataImpulse rotating residential proxy defined in
-    ``settings.proxy_url``.  The ``web_profile_info`` endpoint returns a
-    clean JSON payload with the user object or ``null`` — no HTML parsing
-    required.
+    Instagram's ``/api/v1/oembed/`` endpoint is a stable, public,
+    unauthenticated API designed for third-party embed widgets.  It
+    returns JSON metadata (``author_name``, ``author_id``, etc.) for
+    existing profiles (HTTP 200) and a clean 404 for non-existent ones.
 
-    curl_cffi's ``impersonate="chrome124"`` matches a real Chrome 124 TLS
-    fingerprint, so Instagram sees the request as originating from a
-    legitimate browser on a residential IP.
+    Routing through a residential proxy (DataImpulse) prevents data-center
+    IP blocks, while curl_cffi's browser impersonation matches a real
+    Chrome 124 TLS fingerprint — making the request indistinguishable
+    from a legitimate browser on a home connection.
+
+    No ``sessionid`` or ``csrftoken`` cookies are injected, so there is
+    zero risk of IP-session mismatch revocation (the root cause of
+    previous 401 errors).
 
 Integration:
     - CheckResult dataclass and CheckStatus enum are the public interface.
@@ -41,17 +43,6 @@ from models.username_log import CheckStatus
 logger = logging.getLogger(__name__)
 
 
-# ─── Instagram session credentials ─────────────────────────────────────────────
-# Replace these with valid values from a logged-in browser session.
-# How to obtain:
-#   1. Log in to instagram.com in Chrome (use a burner account).
-#   2. Open DevTools → Application → Cookies → instagram.com.
-#   3. Copy the values for 'sessionid' and 'csrftoken'.
-# These rotate periodically — refresh them if you start seeing 401 errors.
-INSTA_SESSION_ID = "40137255195%3AdYjlsW9FTWJ9MD%3A19%3A3AAYkrmRfVGsglXHzdexZG6BF4FPHdkYlRnApGfH8Fg"
-INSTA_CSRF_TOKEN = "cUHu0IfNR8e9jfzUlfOreEaXcTldRvp8"
-
-
 # ─── Public data structures ────────────────────────────────────────────────────
 
 @dataclass
@@ -68,9 +59,25 @@ class CheckResult:
 
 # ─── Constants ──────────────────────────────────────────────────────────────────
 
-_PROFILE_URL_TEMPLATE = (
-    "https://www.instagram.com/api/v1/users/web_profile_info/?username={}"
+_OEMBED_URL_TEMPLATE = (
+    "https://www.instagram.com/api/v1/oembed/"
+    "?url=https://www.instagram.com/{username_clean}/"
 )
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "Referer": "https://www.instagram.com/",
+}
 
 _RESERVED_USERNAMES: frozenset[str] = frozenset({
     "admin", "administrator", "instagram", "support", "help",
@@ -90,17 +97,17 @@ _USERNAME_RE = re.compile(r"^[a-zA-Z0-9._]{1,30}$")
 
 class InstagramChecker:
     """
-    Deterministic, authenticated Instagram username availability checker.
+    Deterministic, cookie-free Instagram username availability checker.
 
-    Uses curl_cffi AsyncSession with Chrome 124 impersonation, injected
-    session cookies, and the DataImpulse residential proxy to query the
-    ``web_profile_info`` JSON endpoint.
+    Uses curl_cffi AsyncSession with Chrome 124 impersonation and the
+    DataImpulse residential proxy to query Instagram's public oEmbed API.
+    No session cookies or login credentials are used.
 
-    * HTTP 200 + user object present   →  **TAKEN**
-    * HTTP 404 / user object is None   →  **AVAILABLE**
-    * HTTP 401 / 302 to login          →  **ERROR** (session expired)
-    * HTTP 429                         →  **ERROR** (rate-limited)
-    * Anything else                    →  **ERROR** (retried)
+    * HTTP 200 + author metadata present  →  **TAKEN**
+    * HTTP 404                            →  **AVAILABLE**
+    * HTTP 429                            →  **ERROR** (rate-limited)
+    * HTTP 401/403                        →  **ERROR** (blocked)
+    * Anything else                       →  **ERROR** (retried)
     """
 
     def __init__(
@@ -115,7 +122,7 @@ class InstagramChecker:
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Initialise the HTTP session with auth cookies and proxy."""
+        """Initialise the HTTP session with proxy (no cookies)."""
         if self._session is not None:
             return
 
@@ -128,20 +135,9 @@ class InstagramChecker:
             timeout=self._timeout,
         )
 
-        # Inject authenticated session cookies.
-        self._session.cookies.set(
-            "sessionid", INSTA_SESSION_ID,
-            domain=".instagram.com", path="/",
-        )
-        self._session.cookies.set(
-            "csrftoken", INSTA_CSRF_TOKEN,
-            domain=".instagram.com", path="/",
-        )
-
         logger.info(
-            "InstagramChecker started | proxy=%s | session_id=%s…",
+            "InstagramChecker started (cookie-free) | proxy=%s",
             proxy or "direct",
-            INSTA_SESSION_ID[:20] + "…" if len(INSTA_SESSION_ID) > 20 else INSTA_SESSION_ID,
         )
 
     async def stop(self) -> None:
@@ -199,50 +195,34 @@ class InstagramChecker:
 
         return None  # OK — proceed to API check
 
-    # ── Tier 2: Authenticated web_profile_info check ────────────────────────
+    # ── Tier 2: Public oEmbed check (cookie-free, proxy-backed) ─────────────
 
     async def _tier2_api_check(self, username: str, start_time: float) -> CheckResult:
         """
-        GET Instagram's ``web_profile_info`` endpoint as an authenticated
-        session routed through the residential proxy.
+        GET Instagram's public ``oEmbed`` endpoint via the residential proxy
+        to deterministically resolve whether *username* exists.
+
+        No cookies or authentication tokens are sent — the oEmbed API is
+        fully public and designed for unauthenticated embed lookups.
 
         Decision matrix
         ───────────────
-        HTTP 200 + user object present   →  TAKEN
-        HTTP 200 + user object is None   →  AVAILABLE
-        HTTP 404                         →  AVAILABLE
-        HTTP 401 / 403                   →  ERROR (session_expired)
-        HTTP 302 (redirect to login)     →  ERROR (login_redirect)
-        HTTP 429                         →  ERROR (rate_limited)
-        Other / network fault            →  ERROR (retriable)
+        HTTP 200 + author_name/author_id present  →  TAKEN
+        HTTP 404 (profile does not exist)          →  AVAILABLE
+        HTTP 400 (malformed — treat as available)  →  AVAILABLE
+        HTTP 429                                   →  ERROR (rate_limited)
+        HTTP 407                                   →  ERROR (proxy_auth_failed)
+        Other / network fault                      →  ERROR (retriable)
         """
         session = await self._get_session()
 
-        url = _PROFILE_URL_TEMPLATE.format(username)
-
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "X-CSRFToken": INSTA_CSRF_TOKEN,
-            "X-IG-App-ID": "936619743392459",
-            "X-Requested-With": "XMLHttpRequest",
-            "Referer": f"https://www.instagram.com/{username}/",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-        }
+        url = _OEMBED_URL_TEMPLATE.format(username_clean=username)
 
         try:
             resp = await session.get(
                 url,
-                headers=headers,
+                headers=_HEADERS,
                 timeout=self._timeout,
-                allow_redirects=False,
             )
         except Exception as exc:
             logger.warning("Network error checking @%s: %s", username, exc)
@@ -256,42 +236,6 @@ class InstagramChecker:
 
         elapsed = round(time.perf_counter() - start_time, 3)
 
-        # ── HTTP 302/301: redirect (usually to /accounts/login/) ────────
-        if resp.status_code in (301, 302, 303, 307, 308):
-            location = resp.headers.get("location", "")
-            logger.warning(
-                "Redirect for @%s: HTTP %d → %s", username, resp.status_code, location,
-            )
-            return CheckResult(
-                username=username,
-                status=CheckStatus.ERROR,
-                reason="login_redirect",
-                error_message=(
-                    f"HTTP {resp.status_code} redirect to {location} — "
-                    "session cookies may be expired or IP is blocked"
-                ),
-                http_status=resp.status_code,
-                response_time=elapsed,
-            )
-
-        # ── HTTP 401 / 403: authentication failure ──────────────────────
-        if resp.status_code in (401, 403):
-            logger.error(
-                "Auth failure for @%s: HTTP %d — session cookies likely expired",
-                username, resp.status_code,
-            )
-            return CheckResult(
-                username=username,
-                status=CheckStatus.ERROR,
-                reason="session_expired",
-                error_message=(
-                    f"HTTP {resp.status_code} — session cookies expired. "
-                    "Update INSTA_SESSION_ID and INSTA_CSRF_TOKEN in checker.py"
-                ),
-                http_status=resp.status_code,
-                response_time=elapsed,
-            )
-
         # ── HTTP 404: profile does not exist → AVAILABLE ────────────────
         if resp.status_code == 404:
             return CheckResult(
@@ -302,14 +246,48 @@ class InstagramChecker:
                 response_time=elapsed,
             )
 
+        # ── HTTP 400: bad request (non-existent profile URL) → AVAILABLE
+        # Instagram's oEmbed returns 400 for URLs that don't resolve to a
+        # valid profile — functionally identical to 404 for our purposes.
+        if resp.status_code == 400:
+            return CheckResult(
+                username=username,
+                status=CheckStatus.AVAILABLE,
+                reason="truly_available",
+                http_status=400,
+                response_time=elapsed,
+            )
+
         # ── HTTP 429: rate-limited → ERROR (retriable) ──────────────────
         if resp.status_code == 429:
             return CheckResult(
                 username=username,
                 status=CheckStatus.ERROR,
                 reason="rate_limited",
-                error_message="HTTP 429 — rate limited",
+                error_message="HTTP 429 — rate limited by Instagram",
                 http_status=429,
+                response_time=elapsed,
+            )
+
+        # ── HTTP 407: proxy authentication required ─────────────────────
+        if resp.status_code == 407:
+            return CheckResult(
+                username=username,
+                status=CheckStatus.ERROR,
+                reason="proxy_auth_failed",
+                error_message="HTTP 407 — proxy authentication failed (check PROXY_URL credentials)",
+                http_status=407,
+                response_time=elapsed,
+            )
+
+        # ── HTTP 5xx: server error → ERROR (retriable) ─────────────────
+        if resp.status_code >= 500:
+            return CheckResult(
+                username=username,
+                status=CheckStatus.ERROR,
+                reason="server_error",
+                error_message=f"HTTP {resp.status_code} — Instagram server error",
+                http_status=resp.status_code,
                 response_time=elapsed,
             )
 
@@ -324,7 +302,7 @@ class InstagramChecker:
                 response_time=elapsed,
             )
 
-        # ── HTTP 200: parse JSON and inspect user object ────────────────
+        # ── HTTP 200: parse JSON and verify author metadata ─────────────
         try:
             data: dict[str, Any] = resp.json()
         except Exception:
@@ -332,15 +310,16 @@ class InstagramChecker:
                 username=username,
                 status=CheckStatus.ERROR,
                 reason="invalid_json",
-                error_message="Response body is not valid JSON",
+                error_message="HTTP 200 but response body is not valid JSON",
                 http_status=200,
                 response_time=elapsed,
             )
 
-        user_obj = data.get("data", {}).get("user")
+        # oEmbed returns {"author_name": "...", "author_id": ..., ...}
+        # for existing profiles.  Verify at least one identifying field.
+        has_author = bool(data.get("author_name") or data.get("author_id"))
 
-        if user_obj is not None:
-            # Profile exists — handle is taken.
+        if has_author:
             return CheckResult(
                 username=username,
                 status=CheckStatus.TAKEN,
@@ -349,7 +328,8 @@ class InstagramChecker:
                 response_time=elapsed,
             )
 
-        # User object is None / missing — handle is available.
+        # 200 but no author metadata — edge case for deactivated / empty
+        # profiles that return a stub response.  Treat as available.
         return CheckResult(
             username=username,
             status=CheckStatus.AVAILABLE,
@@ -371,13 +351,10 @@ class InstagramChecker:
 
         Pipeline:
             1. Tier 1 — syntax / reserved pre-validation (instant, no network).
-            2. Tier 2 — authenticated web_profile_info API via proxy.
+            2. Tier 2 — public oEmbed API via residential proxy (cookie-free).
 
-        Retries on transient errors (network failures, HTTP 429) up to
+        Retries on transient errors (network failures, HTTP 429, 5xx) up to
         *max_retries* times with incremental back-off.
-
-        Non-retriable errors (401, 403, 302 login redirect) are returned
-        immediately — retrying with the same expired cookies is pointless.
         """
         start_time = time.perf_counter()
         clean = username.strip().lower()
@@ -387,10 +364,7 @@ class InstagramChecker:
         if precheck is not None:
             return precheck
 
-        # ── Tier 2: authenticated API check (with retries) ──────────────
-        # Reasons that should NOT be retried (fix credentials, not loop).
-        _non_retriable = frozenset({"session_expired", "login_redirect"})
-
+        # ── Tier 2: oEmbed API check (with retries) ─────────────────────
         last_result: Optional[CheckResult] = None
 
         for attempt in range(max_retries + 1):
@@ -398,10 +372,6 @@ class InstagramChecker:
 
             # Definitive answers — return immediately.
             if result.status in (CheckStatus.AVAILABLE, CheckStatus.TAKEN):
-                return result
-
-            # Non-retriable auth errors — return immediately.
-            if result.reason in _non_retriable:
                 return result
 
             # Transient error — retry after back-off.
@@ -412,7 +382,7 @@ class InstagramChecker:
                     "Retry %d/%d for @%s (reason=%s), sleeping %.1fs",
                     attempt + 1, max_retries, clean, result.reason, backoff,
                 )
-                # Reset session on rate-limit to cycle connection / proxy IP.
+                # Reset session on rate-limit to cycle proxy IP.
                 if result.reason == "rate_limited":
                     await self.close()
                 await asyncio.sleep(backoff)
